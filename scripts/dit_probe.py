@@ -698,11 +698,23 @@ def step_d0(res, mon, save):
 
 
 def step_cd(res, mon, save):
-    mon.step = "import_handler"
-    res["import"] = import_stage("handler")
+    # 実験・オプトイン（dit_diag.py --cuda-first）: CUDA を先に初期化してから acestep 等を import する。D0b の実測では、
+    # peft / diffusers / torchao 等を CUDA 初期化より前に import すると CUDA 初期化が +3.3〜4.0GB になるため。
+    # 実 DiT のロード・生成でのピークへの効果は未検証。既定は従来の順序（import → CUDA）
+    cuda_first = os.environ.get("LUNARIA_CUDA_FIRST") == "1"
+    res["cuda_first"] = cuda_first
+    if cuda_first:
+        mon.step = "cuda_init"
+        res["cuda_init"] = cuda_init_stage()
+        mon.step = "import_handler"
+        res["import"] = import_stage("handler")
+    else:
+        mon.step = "import_handler"
+        res["import"] = import_stage("handler")
     import torch
-    mon.step = "cuda_init"
-    res["cuda_init"] = cuda_init_stage()
+    if not cuda_first:
+        mon.step = "cuda_init"
+        res["cuda_init"] = cuda_init_stage()
     res["private_after_cuda_gb"] = round(res["cuda_init"]["after"]["private_mb"] / 1024, 3)
     res["phys_after_cuda"] = phys_since_start()
     save()

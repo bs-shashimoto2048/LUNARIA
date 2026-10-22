@@ -75,6 +75,8 @@
 - **「`safe_open(device="cuda")` が約 2.9 倍」は誤り**。D0 の検証（`.float()` で全要素の有限性を確認）が GPU に一時領域を作り、private・VRAM を増やしていた。本来は **約 2 倍**
 - **「CUDA コンテキストの物理 2.6GB」は誤り**。torch のみの CUDA 初期化は +306MB。前回の B2 の +3,987MB は、import した何かとの組み合わせ（§3.1）
 
+- **D0b による追記**: 上記の「import した何か」は、`acestep.handler` が eager に読み込む学習用ライブラリ（peft / lycoris 等）を含む import 連鎖だった。CUDA を先に初期化すると増分は +306MB に留まる。詳細は [PHASE0_IMPORT_MEMORY_INVESTIGATION.md](PHASE0_IMPORT_MEMORY_INVESTIGATION.md)（直接機構は未特定、最初の GPU 処理・実生成での効果は未検証）
+
 ## 5. private bytes とシステム commit の関係（測定に基づく分析）
 
 | 操作 | private 増分 | システム commit 増分 | 比 |

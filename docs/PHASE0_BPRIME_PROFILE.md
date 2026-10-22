@@ -149,3 +149,5 @@ B′ の初期化では、DiT が CPU 上に実体化され、LM と Text Encode
 - 実機 DiT での torchao 互換性（速度・数値・生成音声）
 - LM backend を pt に固定することの要否
 - 30 秒インストの生成と WAV 検証（Stage A）
+
+> **D0b による追記**: import 由来の RAM・commit 増加（CUDA 初期化が import 順で約 +0.3GB〜+4GB に変わる）の調査結果は [PHASE0_IMPORT_MEMORY_INVESTIGATION.md](PHASE0_IMPORT_MEMORY_INVESTIGATION.md) を参照。先の「CUDA コンテキストが物理 2.6GB」は訂正済み（import 連鎖由来）。CUDA 先行初期化は実験的オプトイン（既定オフ）で、実生成ピークでの効果は未検証。

@@ -226,6 +226,8 @@ def run_child(step, run_id, results):
     if "--disable-warmup" in sys.argv:  # 既定オフ。caching_allocator_warmup を無効化して commit の急増を避けられるか確認する用
         env["LUNARIA_DISABLE_WARMUP"] = "1"
     env["LUNARIA_DIT_PATH"] = parse_path(sys.argv)  # gpu-direct（D1/D2）または cpu-via（D3）
+    if "--cuda-first" in sys.argv:  # 実験・オプトイン（既定オフ）。CUDA を先に初期化してから import する（D0b の知見）
+        env["LUNARIA_CUDA_FIRST"] = "1"
     py = ROOT / ".venv-engine" / "Scripts" / "python.exe"
     before = {"resources": current_resources(), "vram": vram_state()}
     logf = open(log, "wb")
@@ -286,7 +288,7 @@ def main():
     R = {"run_id": run_id, "mode": "dry-run" if dry else "run", "started": time.strftime("%Y-%m-%d %H:%M:%S"),
          "generation": "NOT RUN", "lm_te_vae": "NOT INITIALIZED", "steps": {}, "admission": {},
          "options": {"steps": list(steps), "path": parse_path(sys.argv),
-                     "disable_warmup": "--disable-warmup" in sys.argv}}
+                     "disable_warmup": "--disable-warmup" in sys.argv, "cuda_first": "--cuda-first" in sys.argv}}
     st = None
     if not dry:
         st = p0.State()

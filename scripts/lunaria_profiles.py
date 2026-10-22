@@ -121,6 +121,72 @@ def dit_diag_admission(step, measured=None, avail_gb=None, commit_headroom_gb=No
     return out
 
 
+# --- D0b（import のメモリ消費の切り分け。モデルなし）の許可条件 ------------------------------------
+# 診断対象ごとのメモリ予算が不明なので、過去の最大実測値を基準に保守的に判定する:
+#   import のみ（acestep.api_server まで）: 物理 0.66〜0.81GB / commit 2.55GB（B1・B2）
+#   torch のみ + CUDA 初期化（D0）: 物理 0.63GB / private 約 1.9GB
+#   重い構成 + CUDA 初期化（前回 B2）: 物理 3.40GB / private 6.38GB / VRAM 861MiB
+D0B_HEAVY_TOKENS = ("transformers", "transformers_auto", "accelerate", "diffusers", "torchaudio", "torchao", "triton",
+                    "acestep.handler", "acestep.llm_inference", "acestep.api_server", "acestep.gpu_config",
+                    "peft", "lycoris", "lightning", "acestep.training", "acestep.core.generation.handler")
+
+
+# 前回 B2 が実際に読み込んだ範囲（acestep.handler の連鎖に含まれる torchaudio・torchao 等も B2 で読み込まれた）
+D0B_B2_TOKENS = frozenset({"torch", "accelerate", "diffusers", "transformers", "transformers_auto", "torchaudio", "torchao",
+                           "acestep.gpu_config", "acestep.handler", "cuda", "safetensors", "numpy", "soundfile", "loguru",
+                           "tqdm", "peft", "lycoris", "lightning", "acestep.training", "acestep.core.generation.handler",
+                           "cuda_work", "flash_attn"})  # 末尾は、B2 の連鎖（acestep.handler の eager な学習用モジュール、peft 経由の flash_attn）に含まれるもの + 小さな GPU 処理
+
+
+def d0b_admission(spec, avail_gb=None, commit_headroom_gb=None, free_vram_mib=None):
+    """D0b の 1 構成（トークン列）を実行してよいか。見込み消費量 + 安全余裕 3GB（commit は + 4GB）。"""
+    tokens = [t for t in spec.split(",") if t]
+    cuda = "cuda" in tokens
+    # torch の内部モジュール（torch._dynamo など。原因の切り分け用）は、B2 の連鎖の中で読み込まれていたものとして重い構成に含める
+    heavy = any(t in D0B_HEAVY_TOKENS or t.startswith("torch.") for t in tokens)
+    # D0b の実測: flash_attn（flash_attn_2_cuda）を CUDA 初期化より前にロードすると、CUDA 初期化が +4.0GB（物理 +2.7GB）になる。
+    # CUDA 初期化より前の flash_attn は重い構成として扱う（B2 では peft 経由でロードされていた = B2 の範囲内）
+    flash_before_cuda = cuda and "flash_attn" in tokens and tokens.index("flash_attn") < tokens.index("cuda")
+    heavy = heavy or flash_before_cuda
+    flash = "flash_attn" in tokens and not flash_before_cuda  # CUDA 初期化の後の flash_attn は、ロード自体の追加（未測定）のみ
+    if cuda and heavy and all(t in D0B_B2_TOKENS or t.startswith("torch.") for t in tokens):
+        # 前回 B2（torch + accelerate + diffusers + transformers + acestep.handler + CUDA）の部分集合。
+        # 読み込むものが B2 の範囲内なので、B2 の実測値（物理 3.40GB / private 6.38GB / ピーク private 6.54GB）が上限になる見込み
+        ram, commit, basis = 3.40 + 0.3, 6.54 + 0.6, "前回 B2 の実測値が上限になる部分集合（物理 3.40GB / ピーク private 6.54GB）+ 余裕"
+    elif cuda and heavy:
+        ram, commit, basis = 3.40 + 0.5, 6.38 + 1.0, "前回 B2 の最大実測（物理 3.40GB / private 6.38GB）+ 余裕（B2 の範囲外の読み込みを含む）"
+    elif cuda:
+        ram, commit, basis = 1.0, 2.5, "D0 の実測（物理 0.63GB / private 約 1.9GB）+ 余裕"
+    elif heavy:
+        ram, commit, basis = 1.5, 3.5, "import のみの最大実測（物理 0.81GB / commit 2.55GB）+ 余裕"
+    else:
+        ram, commit, basis = 1.0, 2.5, "軽い import（torch 以下）+ 余裕"
+    if "cuda_work" in tokens and heavy:
+        # 実測（D0b 第 2 段 W1）: acestep.handler を import した後の最初の GPU 処理（cuBLAS・cuDNN・SDPA）で、空き RAM が
+        # 開始時 8.33GB → 2.94GB（-5.4GB）まで低下し、なお増加中に子プロセスが下限で自己停止した。同じ処理は import なしでは物理 0.18GB。
+        # 最終的な消費は不明なので、観測値に未観測分の上乗せ（+1.5GB）をして判定する。
+        ram, commit = 5.4 + 1.5, 9.5 + 1.0
+        basis = "W1 の実測（重い連鎖の後の最初の GPU 処理で物理 -5.4GB 以上、増加中に停止）+ 未観測分の上乗せ"
+    if flash:  # flash_attn の拡張モジュールの読み込みは未測定のため、さらに上乗せ
+        ram, commit = ram + 1.0, commit + 1.5
+        basis += " + flash_attn（未測定のため +1.0GB / +1.5GB）"
+    vram = 0 if not cuda else 861 + 256 + 512
+    out = {"spec": spec, "consumption_gb": round(ram, 2), "commit_consumption_gb": round(commit, 2), "basis": basis,
+           "safety_floor_gb": SAFETY_FLOOR_GB, "required_free_ram_gb": round(ram + SAFETY_FLOOR_GB, 2),
+           "required_commit_headroom_gb": round(commit + MIN_COMMIT_MARGIN_GB, 2), "required_free_vram_mib": vram}
+    if avail_gb is not None:
+        out["checks"] = {
+            "free_ram": {"ok": avail_gb >= out["required_free_ram_gb"],
+                         "detail": f"{avail_gb:.2f}GB >= {out['required_free_ram_gb']}GB（消費 {out['consumption_gb']} + 余裕 {SAFETY_FLOOR_GB}）"},
+            "commit_headroom": {"ok": commit_headroom_gb is not None and commit_headroom_gb >= out["required_commit_headroom_gb"],
+                                "detail": f"{commit_headroom_gb}GB >= {out['required_commit_headroom_gb']}GB"},
+            "free_vram": {"ok": vram == 0 or (free_vram_mib is not None and free_vram_mib >= vram),
+                          "detail": f"{free_vram_mib}MiB >= {vram}MiB"},
+        }
+        out["ok"] = all(c["ok"] for c in out["checks"].values())
+    return out
+
+
 def b_prime_admission():
     """B′ の初期化診断（測定モード）に必要な空き資源。根拠は A の初期化時の実測。"""
     peak = MEASURED_A_INIT_PEAK_RSS_GB

@@ -131,6 +131,30 @@ def placement_report(handler, llm_handler):
     }
 
 
+CUDA_FIRST_RESULT = {}
+
+
+def cuda_first_init():
+    """（実験・オプトイン `LUNARIA_CUDA_FIRST=1`）acestep / peft 等を import する前に CUDA コンテキストを作成する。
+
+    根拠（D0b、docs/PHASE0_IMPORT_MEMORY_INVESTIGATION.md）: peft / lycoris / diffusers / torchao（と、それらを eager に import する
+    acestep.handler・api_server）を CUDA 初期化より前に import すると、CUDA 初期化が +3.3〜4.0GB（物理 +2.0〜2.8GB、VRAM +861MiB）になる。
+    CUDA を先に初期化してから同じ import を行うと、CUDA 初期化は +306MB（VRAM +145MiB）で済み、handler の import も +0.9GB 程度。
+    ただし import 直後の最初の GPU 処理や、実モデルのロード・生成でのピークが下がるかは**未検証**のため、既定にはしない。
+    """
+    import torch
+    if not torch.cuda.is_available():
+        return {"applied": False, "reason": "CUDA unavailable"}
+    before = proc_mem()
+    torch.cuda.init()
+    x = torch.zeros(1, device="cuda")
+    torch.cuda.synchronize()
+    del x
+    after = proc_mem()
+    return {"applied": True, "private_delta_mb": after["private_mb"] - before["private_mb"],
+            "rss_delta_mb": after["rss_mb"] - before["rss_mb"]}
+
+
 def assert_profile_env(profile_id=lp.PROFILE_B_PRIME):
     """想定外の環境でラッパーが起動されたら止める（プロファイル外の設定の混入を防ぐ）。"""
     problems = []
@@ -462,6 +486,7 @@ def diag_thread(app, server, report_path, timeout_s):
         report["server_started"] = bool(getattr(server, "started", False))
         report["verify_int8"] = VERIFY_RESULTS[-1] if VERIFY_RESULTS else None
         report["lowpeak_patches_applied"] = list(LOWPEAK_APPLIED)
+        report["cuda_first"] = dict(CUDA_FIRST_RESULT) or {"applied": False}
         report["load_events"] = list(LOAD_EVENTS)  # 段階ごとの private メモリ（A の初期化との比較用）
         report["llm_initialized"] = bool(getattr(app.state, "_llm_initialized", False))
         report["llm_init_error"] = getattr(app.state, "_llm_init_error", None)
@@ -492,6 +517,8 @@ def main():
     problems = upstream_assumption_problems()
     if problems:  # 上流の形が想定と違うなら、盲目的にパッチせず失敗させる
         raise RuntimeError("上流 ACE-Step の前提が崩れている: " + "; ".join(problems))
+    if os.environ.get("LUNARIA_CUDA_FIRST") == "1":  # 実験・オプトイン。acestep を import する前に CUDA を初期化する
+        CUDA_FIRST_RESULT.update(cuda_first_init())
     apply_patch()
     apply_low_peak_patches()
 

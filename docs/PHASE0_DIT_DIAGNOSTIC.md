@@ -172,3 +172,5 @@ commit 上限が実際には動的（ページファイルの自動拡張）で�
 - `scripts/phase0_run.py` — テレメトリに `commit_headroom_gb`、commit 下限の中断を追加
 - `scripts/test_dit_diag.py` — 単体テスト 22 件（GPU・実モデル不使用）
 - 結果ファイル（Git 管理外）: `data/logs/dit_diag_<run_id>.json`、`dit_probe_<run_id>_<step>.json / .log`
+
+> **D0b による追記**: import 由来の RAM・commit 増加（CUDA 初期化が import 順で約 +0.3GB〜+4GB に変わる）の調査結果は [PHASE0_IMPORT_MEMORY_INVESTIGATION.md](PHASE0_IMPORT_MEMORY_INVESTIGATION.md) を参照。先の「CUDA コンテキストが物理 2.6GB」は訂正済み（import 連鎖由来）。CUDA 先行初期化は実験的オプトイン（既定オフ）で、実生成ピークでの効果は未検証。

@@ -168,3 +168,5 @@ L = 2.55 [実測]。各モデルは「ファイルサイズ × 1.14（実測係�
 - `scripts/measure_load_memory.py` — CPU・合成データによるメモリ挙動の実測（E1〜E4）
 - `scripts/audit_acestep_memory.py` — 固定 commit・固定版 transformers の静的検証（37 項目）
 - `scripts/test_bprime_wrapper.py` — 単体テスト 38 件（GPU・実モデル不使用）
+
+> **D0b による追記**: import 由来の RAM・commit 増加（CUDA 初期化が import 順で約 +0.3GB〜+4GB に変わる）の調査結果は [PHASE0_IMPORT_MEMORY_INVESTIGATION.md](PHASE0_IMPORT_MEMORY_INVESTIGATION.md) を参照。先の「CUDA コンテキストが物理 2.6GB」は訂正済み（import 連鎖由来）。CUDA 先行初期化は実験的オプトイン（既定オフ）で、実生成ピークでの効果は未検証。
