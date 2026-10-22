@@ -313,6 +313,7 @@ class Monitor(threading.Thread):
         self.phase = "init"
         self.max_vram = 0
         self.max_rss = 0
+        self.max_private = 0
         self.min_free_ram = 1e9
         self.pressure = False
         self._low = 0
@@ -324,11 +325,14 @@ class Monitor(threading.Thread):
             while not self.stop_flag:
                 used, _ = gpu_mem_mib()
                 rss = 0
+                private = 0  # Windows の private bytes（コミット量。ファイルマップ分を含まない）
                 try:
                     p = psutil.Process(self.root_pid)
                     for q in [p] + p.children(recursive=True):
                         try:
-                            rss += q.memory_info().rss
+                            mi = q.memory_info()
+                            rss += mi.rss
+                            private += getattr(mi, "private", 0)
                         except psutil.Error:
                             pass
                 except psutil.Error:
@@ -338,6 +342,7 @@ class Monitor(threading.Thread):
                     if used:
                         self.max_vram = max(self.max_vram, used)
                     self.max_rss = max(self.max_rss, rss)
+                    self.max_private = max(self.max_private, private)
                     self.min_free_ram = min(self.min_free_ram, snap["free_ram_gb"])
                     self._low = self._low + 1 if snap["free_ram_gb"] < ABORT_FREE_RAM_GB else 0
                     if self._low >= ABORT_CONSECUTIVE:
@@ -347,15 +352,17 @@ class Monitor(threading.Thread):
                     f.write(json.dumps({"run_id": RUN_ID, "t": time.strftime("%H:%M:%S"), "tag": self.tag,
                                         "phase": self.phase,
                                         "vram_mib": used,
-                                        "tree_rss_mb": round(rss / 1048576), **snap}) + "\n")
+                                        "tree_rss_mb": round(rss / 1048576),
+                                        "tree_private_mb": round(private / 1048576), **snap}) + "\n")
                     f.flush()
                 time.sleep(1)
 
     def snapshot_and_reset(self):
         with self.lock:
             r = {"max_vram_mib": self.max_vram, "max_rss_mb": round(self.max_rss / 1048576),
+                 "max_private_mb": round(self.max_private / 1048576),
                  "min_free_ram_gb": None if self.min_free_ram == 1e9 else self.min_free_ram}
-            self.max_vram = self.max_rss = 0
+            self.max_vram = self.max_rss = self.max_private = 0
             self.min_free_ram = 1e9
         return r
 

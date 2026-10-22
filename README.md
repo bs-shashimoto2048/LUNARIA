@@ -31,6 +31,7 @@ LUNARIA/
 
 Windows 11 / RTX 4070 Laptop GPU（8GB）/ Python 3.11.17（uv）/ PyTorch 2.7.1+cu128 / ACE-Step `ca1e85f`。
 構築・再現手順: `docs/PHASE0_SETUP.md`。移行記録: `docs/PHASE0_MIGRATION.md`。実測結果: `docs/PHASE0_GPU_BASELINE.md`。
+低メモリ運用の設計と ACE-Step のメモリ管理の監査: `docs/PHASE0_LOW_MEMORY_DESIGN.md`。
 互換性・ライセンス（`PHASE0_COMPATIBILITY.md`）は未作成。ACE-Step 本体は MIT、モデルカードも MIT。
 
 ## 取得とセットアップ（概要）
