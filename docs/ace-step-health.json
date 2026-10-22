@@ -1,0 +1,15 @@
+{
+  "data": {
+    "status": "ok",
+    "service": "ACE-Step API",
+    "version": "1.0",
+    "models_initialized": true,
+    "llm_initialized": true,
+    "loaded_model": "acestep-v15-turbo",
+    "loaded_lm_model": "acestep-5Hz-lm-0.6B"
+  },
+  "code": 200,
+  "error": null,
+  "timestamp": 1792642955408,
+  "extra": null
+}

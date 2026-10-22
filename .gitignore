@@ -1,0 +1,45 @@
+# ローカルツール・仮想環境
+.tools/
+.venv*/
+venv/
+node_modules/
+__pycache__/
+*.pyc
+
+# 上流 ACE-Step は git submodule（engine/ACE-Step-1.5、commit 固定）で管理する。
+# checkpoints は models/ へのジャンクション（モデル実体は追跡しない）
+engine/ACE-Step-1.5/checkpoints
+engine/ACE-Step-1.5/checkpoints/
+
+# モデル・キャッシュ
+models/
+checkpoints/
+.cache/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# 生成物・ログ・DB（data 配下はディレクトリ構造のみ .gitkeep で保持）
+data/**/*
+!data/**/
+!data/**/.gitkeep
+
+# 生成音源
+*.wav
+*.flac
+*.mp3
+
+# 機密・環境
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
