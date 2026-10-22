@@ -50,10 +50,14 @@ DIT_FILE_VRAM_MIB = 4570         # DiT bf16 の重み 4.46GiB（実測のファ�
 CUDA_CTX_VRAM_UPPER_MIB = 1024   # CUDA コンテキストの VRAM 上限見積り（未測定。B2 の実測値で置換する）
 SAFETY_FLOOR_GB = HARD_ABORT_FLOOR_GB  # 3.0
 # DiT 診断（run 20261022-164908、未量子化 DiT の GPU 直接ロードで torch_cpu.dll がアクセス違反）の観測:
-#   VRAM の先確保（caching_allocator_warmup）と同時にプロセスの commit が CUDA コンテキスト後の 6.5GB から 20.3GB へ約 2 秒間急増し、
-#   その後 11.2GB（+4.7GB。VRAM 4.5GB 分に相当）へ落ちた。開始前のシステム commit 余裕は 16.3GB で、
-#   急増分（+13.8GB）が余裕を超えていた（commit 上限超過が有力な原因）。物理 RAM は最後まで 4.3GB 以上を維持。
+#   ロード開始と同時にプロセスの commit が CUDA コンテキスト後の 6.5GB から 20.3GB へ急増し、その後 11.2GB（+4.7GB）へ落ちた。
+#   急増分（+13.8GB）は DiT ファイル（約 4.6GB）の約 3 倍、低下分は約 2 倍、残りは約 1 倍。
+#   CPU のみの実測（E5）で、safetensors の 1 マッピングごとに commit がファイルサイズ分計上されることを確認済み（機構は PHASE0_COMMIT_SPIKE）。
+#   原因（mmap の重複 / CUDA 確保 / 両方）は未確定のため、どの DiT ロード方式の許可条件にも、この観測値を使う。
 DIT_COMMIT_PEAK_OBSERVED_GB = 13.8
+# 同診断の B2（import + CUDA コンテキスト）の実測。以降の許可条件の既定値に使う（同じ構成の再測定で置き換わる）。
+CUDA_BASE_PHYS_MEASURED_GB = 3.40     # 物理消費（import 0.81 + CUDA コンテキスト 約 2.6）
+CUDA_BASE_PRIVATE_MEASURED_GB = 6.38  # private（commit 量）
 
 
 def dit_diag_admission(step, measured=None, avail_gb=None, commit_headroom_gb=None, free_vram_mib=None):
@@ -71,25 +75,29 @@ def dit_diag_admission(step, measured=None, avail_gb=None, commit_headroom_gb=No
         basis = "import は E1 実測（private 2.553GB。物理消費は未測定のため保守側の値を使用）"
         vram_need = 0
     elif step == "b2":
-        imp_ram = measured.get("b1_phys_gb", IMPORT_FULL_PRIVATE_GB)
-        ram = imp_ram + CUDA_HOST_UPPER_GB
-        commit = IMPORT_FULL_PRIVATE_GB + CUDA_HOST_UPPER_GB
-        basis = (f"import は{'B1 の物理消費の実測値' if 'b1_phys_gb' in measured else 'E1 実測（保守側）'}"
-                 f"{imp_ram:.2f}GB + CUDA ホストは未測定の上限見積り {CUDA_HOST_UPPER_GB}GB")
+        base_ram, base_commit = CUDA_BASE_PHYS_MEASURED_GB, CUDA_BASE_PRIVATE_MEASURED_GB
+        ram, commit = base_ram, base_commit
+        basis = f"import + CUDA コンテキストは前回診断の実測値（物理 {base_ram}GB / private {base_commit}GB）"
         vram_need = CUDA_CTX_VRAM_UPPER_MIB + 256
     elif step == "cd":
         dit_upper = STAGE_NEED_GB["dit_gpu_direct"]
-        if "b2_phys_after_cuda_gb" in measured:
-            base_ram, tag = measured["b2_phys_after_cuda_gb"], "import + CUDA コンテキストは B2 の物理消費の実測値"
-        else:
-            base_ram, tag = IMPORT_FULL_PRIVATE_GB + CUDA_HOST_UPPER_GB, "import + CUDA は上限見積り（B2 未実測）"
-        base_commit = measured.get("b2_private_after_cuda_gb", IMPORT_FULL_PRIVATE_GB + CUDA_HOST_UPPER_GB)
+        base_ram = measured.get("b2_phys_after_cuda_gb", CUDA_BASE_PHYS_MEASURED_GB)
+        base_commit = measured.get("b2_private_after_cuda_gb", CUDA_BASE_PRIVATE_MEASURED_GB)
+        tag = "今回の B2 の実測値" if "b2_phys_after_cuda_gb" in measured else "前回診断の B2 の実測値"
         # commit は観測した急増（+13.8GB）を下回らないようにする（推定の上限ではなく実際に観測した値）
         ram, commit = base_ram + dit_upper, base_commit + max(dit_upper, DIT_COMMIT_PEAK_OBSERVED_GB)
-        basis = (f"{tag} {base_ram:.2f}GB + DiT の物理上限 {dit_upper}GB / "
+        basis = (f"import + CUDA は{tag}（物理 {base_ram:.2f}GB / private {base_commit:.2f}GB）+ DiT の物理上限 {dit_upper}GB / "
                  f"commit は観測した急増 +{DIT_COMMIT_PEAK_OBSERVED_GB}GB を使用")
-        ctx = measured.get("ctx_vram_mib", CUDA_CTX_VRAM_UPPER_MIB)
+        ctx = measured.get("ctx_vram_mib", 861)  # B2 の実測（MiB）。未取得なら前回の実測値
         vram_need = DIT_FILE_VRAM_MIB + ctx + VRAM_MARGIN_MIB
+    elif step == "d0":
+        # D0: モデルなしの合成 CUDA 確保（最大 1GiB）+ 合成 safetensors（256MB）の GPU 直接読み込み。GPU の commit 計上の切り分け用
+        base_ram = measured.get("b2_phys_after_cuda_gb", CUDA_BASE_PHYS_MEASURED_GB)
+        base_commit = measured.get("b2_private_after_cuda_gb", CUDA_BASE_PRIVATE_MEASURED_GB)
+        ram = base_ram + 0.5
+        commit = base_commit + 3.0  # 確保 1GiB + マッピング 256MB が最大 3 倍に計上されうるとして、保守側に 3GB
+        basis = f"import + CUDA は実測 + 合成テストの物理 0.5GB / commit は最大 3 倍計上を想定して +3.0GB"
+        vram_need = measured.get("ctx_vram_mib", 861) + 1024 + 256 + VRAM_MARGIN_MIB
     else:
         raise ValueError(step)
     cons = ram

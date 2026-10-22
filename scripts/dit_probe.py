@@ -43,25 +43,40 @@ def mem():
     return {"rss_mb": round(mi.rss / MB), "private_mb": round(getattr(mi, "private", 0) / MB)}
 
 
+import ctypes  # noqa: E402
+
+
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+_GMS_LOCK = threading.Lock()
+_GMS = _MEMORYSTATUSEX()
+_GMS.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+
+
+def _global_memory_status():
+    """(空き物理 RAM, commit 余裕) のバイト数。GlobalMemoryStatusEx 1 回（約 2µs）。
+
+    psutil.virtual_memory() はこの環境で約 20ms かかり、0.1 秒間隔のサンプラーには重すぎるため使わない
+    （psutil の available も Windows では ullAvailPhys と同じ値）。
+    """
+    with _GMS_LOCK:
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(_GMS))
+        return _GMS.ullAvailPhys, _GMS.ullAvailPageFile
+
+
 def avail_gb():
-    return psutil.virtual_memory().available / GB
+    return _global_memory_status()[0] / GB
 
 
 def commit_headroom_gb():
     """システムの commit 余裕（GlobalMemoryStatusEx: 上限 − 使用）。物理 RAM に余裕があっても commit は尽きうる。"""
-    import ctypes
-
-    class MS(ctypes.Structure):
-        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-
-    m = MS()
-    m.dwLength = ctypes.sizeof(MS)
-    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
-    return m.ullAvailPageFile / GB
+    return _global_memory_status()[1] / GB
 
 
 def settle(sec=1.0):
@@ -92,17 +107,108 @@ def atomic_write(path, obj):
     os.replace(tmp, p)
 
 
-class SelfMonitor(threading.Thread):
-    """プロセス private と空き RAM を 0.25 秒間隔で採取する軽量スレッド（系列は 1 秒に 1 点だけ保持）。
+class JsonlStream:
+    """1 行ごとに flush する JSONL 書き出し。プロセスがクラッシュしても、そこまでの系列とイベントが残る。"""
 
-    空き RAM が floor_gb を consecutive 回連続で下回ったら on_abort を呼ぶ（既定: 結果を保存して os._exit(3)）。
+    def __init__(self, path):
+        self.path = Path(path)
+        self._f = None
+        self._lock = threading.Lock()
+
+    def write(self, row):
+        with self._lock:
+            if self._f is None:
+                self._f = open(self.path, "a", encoding="utf-8")
+            self._f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+            self._f.flush()
+
+    def close(self):
+        with self._lock:
+            if self._f is not None:
+                self._f.close()
+                self._f = None
+
+
+STREAM = None  # 実行時に JsonlStream を設定する（event() とサンプラーが同じストリームへ書く）
+EVENTS = []
+
+
+def event(name, **kw):
+    """工程の区切りを、その瞬間の private / commit 余裕とともに記録する（高頻度サンプルの補助）。"""
+    row = {"event": name, "t": round(time.time(), 3), "private_mb": mem()["private_mb"],
+           "commit_headroom_gb": round(commit_headroom_gb(), 3), **kw}
+    EVENTS.append(row)
+    if STREAM is not None:
+        STREAM.write(row)
+    return row
+
+
+class _SafeOpenProxy:
+    """safetensors.safe_open の戻り値の薄いプロキシ。開閉の瞬間を記録する（挙動は変えない）。"""
+
+    def __init__(self, real, device):
+        self._real, self._device = real, device
+        event("safe_open", device=str(device))
+
+    def __enter__(self):
+        self._real.__enter__()
+        return self
+
+    def __exit__(self, *a):
+        r = self._real.__exit__(*a)
+        event("safe_open_close", device=str(self._device))
+        return r
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def install_load_instrumentation(mu=None):
+    """transformers.modeling_utils の safe_open と caching_allocator_warmup を、挙動を変えずに計装する。
+
+    どの工程で commit / private が急増するかを時刻つきで特定するため。戻り値は元に戻す関数（テスト用）。
+    """
+    if mu is None:
+        import transformers.modeling_utils as mu
+    orig_open, orig_warm = mu.safe_open, mu.caching_allocator_warmup
+    if getattr(orig_open, "_lunaria_instr", False):
+        return lambda: None
+
+    def open_wrapper(*args, **kwargs):
+        dev = kwargs.get("device", "cpu")
+        real = orig_open(*args, **kwargs)
+        return _SafeOpenProxy(real, dev)
+
+    def warm_wrapper(*args, **kwargs):
+        event("warmup_start")
+        try:
+            return orig_warm(*args, **kwargs)
+        finally:
+            event("warmup_end")
+
+    open_wrapper._lunaria_instr = True
+    mu.safe_open, mu.caching_allocator_warmup = open_wrapper, warm_wrapper
+
+    def uninstall():
+        mu.safe_open, mu.caching_allocator_warmup = orig_open, orig_warm
+    return uninstall
+
+
+class SelfMonitor(threading.Thread):
+    """プロセス private・RSS・空き RAM・commit 余裕（と VRAM）を高頻度で採取する軽量スレッド。
+
+    - 全サンプルを JSONL ストリームへ即時書き出し（クラッシュしても残る）。最終 JSON には 1 秒に 1 点だけ保持
+    - 空き RAM / commit 余裕が下限を consecutive 回連続で下回ったら on_abort を呼ぶ（既定: 結果を保存して os._exit(3)）
+    - 精度と負荷の評価のため、実際のサンプル間隔（最大・平均）と 1 回のサンプルの処理時間を記録する
     """
 
     def __init__(self, floor_gb=FLOOR_GB, consecutive=2, avail_fn=avail_gb, private_fn=None, rss_fn=None,
-                 on_abort=None, interval=0.25, commit_fn=commit_headroom_gb, commit_floor_gb=FLOOR_GB):
+                 on_abort=None, interval=0.25, commit_fn=commit_headroom_gb, commit_floor_gb=FLOOR_GB,
+                 stream=None, vram_fn=None):
         super().__init__(daemon=True)
         self.floor_gb, self.consecutive, self.interval = floor_gb, consecutive, interval
         self.commit_fn, self.commit_floor_gb = commit_fn, commit_floor_gb
+        self.stream, self.vram_fn = stream, vram_fn
         self.min_commit = 1e9
         self._clow = 0
         self.avail_fn = avail_fn
@@ -118,20 +224,36 @@ class SelfMonitor(threading.Thread):
         self._ticks = 0
         self.aborted = False
         self.step = "init"
+        self._last_t = None
+        self.max_gap = 0.0
+        self.sum_gap = 0.0
+        self.tick_cost_total = 0.0
 
     def tick(self):
+        t0 = time.perf_counter()
+        if self._last_t is not None:
+            gap = t0 - self._last_t
+            self.max_gap = max(self.max_gap, gap)
+            self.sum_gap += gap
+        self._last_t = t0
         a = self.avail_fn()
         c = self.commit_fn()
         pv = self.private_fn()
         rss = self.rss_fn()
+        vram = self.vram_fn() if self.vram_fn else None
         self.max_private = max(self.max_private, pv)
         self.max_rss = max(self.max_rss, rss)
         self.min_avail = min(self.min_avail, a)
         self.min_commit = min(self.min_commit, c)
         self._ticks += 1
+        row = {"t": round(time.time(), 3), "step": self.step, "private_mb": round(pv / MB), "rss_mb": round(rss / MB),
+               "avail_gb": round(a, 2), "commit_headroom_gb": round(c, 2)}
+        if vram is not None:
+            row["vram_used_mb"] = vram
+        if self.stream is not None:
+            self.stream.write(row)
         if self._ticks % max(1, round(1.0 / self.interval)) == 0:
-            self.series.append({"t": round(time.time(), 1), "step": self.step, "private_mb": round(pv / MB),
-                                "rss_mb": round(rss / MB), "avail_gb": round(a, 2), "commit_headroom_gb": round(c, 2)})
+            self.series.append(row)
         self._low = self._low + 1 if a < self.floor_gb else 0
         self._clow = self._clow + 1 if c < self.commit_floor_gb else 0
         if not self.aborted:
@@ -144,6 +266,7 @@ class SelfMonitor(threading.Thread):
                 self.aborted = True
                 if self.on_abort:
                     self.on_abort(reason)
+        self.tick_cost_total += time.perf_counter() - t0
         return a
 
     def run(self):
@@ -156,7 +279,23 @@ class SelfMonitor(threading.Thread):
                 "min_avail_gb": None if self.min_avail == 1e9 else round(self.min_avail, 2),
                 "min_commit_headroom_gb": None if self.min_commit == 1e9 else round(self.min_commit, 2),
                 "aborted": self.aborted, "series_points": len(self.series),
+                "samples": self._ticks, "interval_target_s": self.interval,
+                "interval_max_s": round(self.max_gap, 3),
+                "interval_mean_s": round(self.sum_gap / max(1, self._ticks - 1), 4),
+                "tick_cost_mean_ms": round(1000 * self.tick_cost_total / max(1, self._ticks), 3),
                 "series": self.series[-300:]}
+
+
+def vram_used_mb():
+    """GPU 全体の VRAM 使用量（MiB）。CUDA 未初期化のときは None（サンプラーが CUDA を初期化しないため）。"""
+    torch = sys.modules.get("torch")
+    try:
+        if torch is not None and torch.cuda.is_initialized():
+            free_b, total_b = torch.cuda.mem_get_info(0)
+            return round((total_b - free_b) / MB)
+    except Exception:
+        pass
+    return None
 
 
 def cuda_mem(torch):
@@ -250,8 +389,12 @@ def run(step, out):
         save()
         os._exit(3)  # 自プロセスのみ終了（他プロセスには触れない）
 
-    mon = SelfMonitor(on_abort=on_abort)
+    global STREAM
+    STREAM = JsonlStream(Path(out).with_suffix(".stream.jsonl"))  # 全サンプルとイベントをクラッシュ耐性つきで保存
+    # 0.1 秒間隔: 1 秒間隔（ランナー側）では見えない瞬間的なピークを捉える。負荷は summary の tick_cost_mean_ms に記録
+    mon = SelfMonitor(on_abort=on_abort, interval=0.1, stream=STREAM, vram_fn=vram_used_mb)
     mon.start()
+    event("process_start", step=step)
     save()
     try:
         if step == "b1":
@@ -268,6 +411,8 @@ def run(step, out):
             res["private_after_cuda_gb"] = round(res["cuda_init"]["after"]["private_mb"] / 1024, 3)
             res["phys_after_cuda"] = phys_since_start()
             res["status"] = "ok"
+        elif step == "d0":
+            step_d0(res, mon, save)
         elif step == "cd":
             step_cd(res, mon, save)
         res["sampler"] = mon.summary()
@@ -278,8 +423,88 @@ def run(step, out):
         res["sampler"] = mon.summary()
     finally:
         mon.stop_flag = True
+        res["events"] = list(EVENTS)  # 工程の区切り（時刻・private・commit 余裕）。高頻度サンプルは .stream.jsonl
         save()
+        STREAM.close()
     return 0 if res.get("status") == "ok" else 1
+
+
+def step_d0(res, mon, save):
+    """D0: モデルなしの合成 CUDA 確保と safe_open(device=cuda) の検証（最大 1GiB）。
+
+    DiT 診断で観測した commit の急増が、(M1) safetensors のファイルマッピング、(M2) CUDA の大きな確保（WDDM）、のどちらに
+    由来するかを、実 DiT を使わずに切り分ける。各操作の前後の private / commit 余裕を、イベントと高頻度サンプルで記録する。
+    transformers が行う順序（warmup 相当の大きな確保 → 解放 → safe_open(device=cuda) で 1 テンソルずつ GPU へ）を小さく再現し、
+    safetensors の CUDA 直接読み込みがこの環境で単独でアクセス違反を起こすかも確認する。
+    """
+    mon.step = "import"
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+    res["import_torch"] = mem()
+    mon.step = "cuda_init"
+    res["cuda_init"] = cuda_init_stage()
+    res["private_after_cuda_gb"] = round(res["cuda_init"]["after"]["private_mb"] / 1024, 3)
+    res["phys_after_cuda"] = phys_since_start()
+    save()
+
+    def at(label, **kw):
+        row = event(label, vram_used_mb=vram_used_mb(), **kw)
+        time.sleep(0.5)  # 高頻度サンプラー（0.1 秒）に確実に捉えさせる
+        return row
+
+    work = ROOT / "data" / "logs" / "d0_tmp"
+    work.mkdir(parents=True, exist_ok=True)
+    path = work / "d0_synthetic.safetensors"
+    try:
+        n_t, elems = 8, 16 * MB  # bf16 で 32MiB × 8 = 256MiB
+        save_file({f"w{i}": torch.randn(elems, dtype=torch.bfloat16) for i in range(n_t)}, str(path))
+        settle(1.0)
+        res["synthetic_file_mb"] = round(path.stat().st_size / MB)
+
+        mon.step = "D0_alloc"
+        torch.cuda.reset_peak_memory_stats(0)
+        at("d0_base")
+        x1 = torch.empty(128 * MB // 2, dtype=torch.float16, device="cuda")   # 128MiB（warmup と同じ形式の 1 回の確保）
+        at("d0_alloc_128MiB")
+        x2 = torch.empty(512 * MB // 2, dtype=torch.float16, device="cuda")   # 512MiB
+        at("d0_alloc_512MiB")
+        del x1, x2
+        at("d0_free_python_ref")
+        torch.cuda.empty_cache()
+        at("d0_empty_cache")
+
+        mon.step = "D0_safe_open_cuda"
+        warm = torch.empty(256 * MB // 2, dtype=torch.float16, device="cuda")  # warmup 相当（モデルのバイト数 1 回の確保）
+        at("d0_warmup_like_256MiB")
+        del warm  # transformers も確保後すぐ参照を落とす（割り当てはキャッシュに残る）
+        at("d0_warmup_like_freed")
+        f = safe_open(str(path), framework="pt", device="cuda:0")             # transformers と同じ開き方
+        at("d0_safe_open_cuda_opened")
+        loaded = {}
+        for k in f.keys():
+            loaded[k] = f.get_slice(k)[...]                                    # 1 テンソルずつ GPU へ（transformers と同じ）
+        torch.cuda.synchronize()
+        at("d0_tensors_on_gpu", devices=sorted({str(t.device) for t in loaded.values()}))
+        f.__exit__(None, None, None)
+        at("d0_safe_open_closed")
+        ok_values = all(bool(torch.isfinite(t.float()).all()) for t in loaded.values())
+        res["d0_values_finite"] = ok_values
+        del loaded
+        torch.cuda.empty_cache()
+        at("d0_cleanup")
+        res["status"] = "ok" if ok_values else "d0_bad_values"
+    finally:
+        try:
+            path.unlink()
+            work.rmdir()
+        except OSError:
+            pass
+    # 機構の切り分け用に、各イベントの private / commit 余裕を基準（d0_base）との差で整理する
+    base = next(e for e in EVENTS if e["event"] == "d0_base")
+    res["d0_deltas"] = [{"event": e["event"], "private_delta_mb": e["private_mb"] - base["private_mb"],
+                         "commit_headroom_delta_gb": round(e["commit_headroom_gb"] - base["commit_headroom_gb"], 3),
+                         "vram_used_mb": e.get("vram_used_mb")} for e in EVENTS if e["event"].startswith("d0_")]
 
 
 def step_cd(res, mon, save):
@@ -295,8 +520,15 @@ def step_cd(res, mon, save):
     import bprime_wrapper as bw
     from acestep.handler import AceStepHandler
     disable_warmup = os.environ.get("LUNARIA_DISABLE_WARMUP") == "1"  # 既定オフ。dit_diag.py --disable-warmup で明示した時のみ
-    bw.apply_low_peak_patches(components=("dit",), disable_warmup=disable_warmup)  # DiT の GPU 直接ロード + RAM ガード
+    # ロード方式: gpu-direct = device_map で GPU へ直接（D1 / warmup 無効なら D2）、cpu-via = 従来の CPU 実体化 → GPU 転送（D3。
+    # 上流のまま。device_map の注入も RAM ガードも付けない）
+    dit_path = os.environ.get("LUNARIA_DIT_PATH", "gpu-direct")
+    res["dit_path"] = dit_path
+    if dit_path == "gpu-direct":
+        bw.apply_low_peak_patches(components=("dit",), disable_warmup=disable_warmup)  # DiT の GPU 直接ロード + RAM ガード
+    install_load_instrumentation()  # safe_open の開閉と warmup の開始・終了を、時刻と commit つきで記録（挙動は変えない）
     res["patches"] = list(bw.LOWPEAK_APPLIED)
+    res["instrumentation"] = ["safe_open (open/close)", "caching_allocator_warmup (start/end)"]
     res["disable_warmup"] = disable_warmup
     h = AceStepHandler()
     h.device = "cuda"
@@ -313,9 +545,11 @@ def step_cd(res, mon, save):
     res["C_pre"] = pre
     save()
     t0 = time.time()
+    event("C_start")
     h._load_main_model_from_checkpoint(model_checkpoint_path=str(MODELS / DIT_DIR), device="cuda",
                                        use_flash_attention=True, compile_model=False, quantization=None)
     torch.cuda.synchronize()
+    event("C_end")
     c_seconds = round(time.time() - t0, 1)
     settle()
     post = {"mem": mem(), "avail_gb": round(avail_gb(), 2), "cuda": cuda_mem(torch),
@@ -348,9 +582,11 @@ def step_cd(res, mon, save):
     h.quantization = QUANT
     d_pre = {"mem": mem(), "cuda": cuda_mem(torch), "avail_gb": round(avail_gb(), 2)}
     t0 = time.time()
+    event("D_start")
     try:
         h._apply_dit_quantization(QUANT)
         torch.cuda.synchronize()
+        event("D_end")
         res["D_error"] = None
     except BaseException as e:
         res["D_error"] = f"{type(e).__name__}: {str(e)[:300]}"
@@ -373,7 +609,7 @@ def step_cd(res, mon, save):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--step", required=True, choices=["b1", "b2", "cd"])
+    ap.add_argument("--step", required=True, choices=["b1", "b2", "cd", "d0"])
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     sys.exit(run(args.step, args.out))

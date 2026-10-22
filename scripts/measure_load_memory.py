@@ -172,12 +172,97 @@ def e4(path):
     return res
 
 
+def commit_headroom_gb():
+    """システム全体の commit 余裕（GlobalMemoryStatusEx）。プロセスの private との対応を見るために併記する。"""
+    import ctypes
+
+    class MS(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    m = MS()
+    m.dwLength = ctypes.sizeof(MS)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+    return m.ullAvailPageFile / 1024**3
+
+
+def e5(path):
+    """E5: safetensors のファイルマッピングが commit（private）に計上されるか、同じファイルを複数同時に開くと何倍になるか。
+
+    DiT 診断で観測した commit の急増（+13.8GB = DiT ファイル 約 4.6GB の約 3 倍、その後 -9.15GB（約 2 倍分）、
+    残り +4.7GB（約 1 倍分））の仮説検証。transformers は 1 回のロードで同じファイルを複数箇所で safe_open する。
+    """
+    import torch  # noqa: F401
+    from safetensors import safe_open
+    settle()
+    base = mem()
+    base_c = commit_headroom_gb()
+    res = {"baseline": base, "baseline_commit_headroom_gb": round(base_c, 3)}
+
+    def snap(label):
+        m = mem()
+        res[label] = {"private_delta_mb": m["private_mb"] - base["private_mb"],
+                      "rss_delta_mb": m["rss_mb"] - base["rss_mb"],
+                      "system_commit_delta_mb": round((base_c - commit_headroom_gb()) * 1024)}
+
+    f1 = safe_open(path, framework="pt", device="cpu")
+    names = list(f1.keys())
+    snap("open1")
+    slices = [f1.get_slice(n) for n in names]
+    snap("open1_get_slice_only")
+    f2 = safe_open(path, framework="pt", device="cpu")
+    _ = list(f2.keys())
+    snap("open2_while_open1")
+    f3 = safe_open(path, framework="pt", device="cpu")
+    _ = list(f3.keys())
+    snap("open3_while_open1_2")
+    held = [s[...] for s in slices]
+    snap("materialized_via_open1")
+    del held
+    del slices
+    settle(2.0)
+    snap("after_del_materialized")
+    f3 = f2 = None
+    settle(2.0)
+    snap("after_close_open2_open3")
+    f1 = None
+    settle(2.0)
+    snap("after_close_all")
+    return res
+
+
+def e5b(path):
+    """E5b: transformers の load_state_dict(map_location='meta')（ヘッダ読み取り）が、ファイルを開いたままにするか。"""
+    import torch  # noqa: F401
+    import transformers.modeling_utils as mu
+    settle()
+    base = mem()
+    base_c = commit_headroom_gb()
+    sd = mu.load_state_dict(path, map_location="meta", weights_only=True)
+    m = mem()
+    res = {"n_keys": len(sd), "private_delta_mb": m["private_mb"] - base["private_mb"],
+           "rss_delta_mb": m["rss_mb"] - base["rss_mb"],
+           "system_commit_delta_mb": round((base_c - commit_headroom_gb()) * 1024)}
+    del sd
+    settle(2.0)
+    m2 = mem()
+    res["after_del_private_delta_mb"] = m2["private_mb"] - base["private_mb"]
+    return res
+
+
 def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "--child":
         mode = sys.argv[2]
         out = {"e1": e1, "e3": e3}.get(mode)
         if mode == "e4":
             out = lambda: e4(sys.argv[3])  # noqa: E731
+        elif mode == "e5":
+            out = lambda: e5(sys.argv[3])  # noqa: E731
+        elif mode == "e5b":
+            out = lambda: e5b(sys.argv[3])  # noqa: E731
         if mode == "e2gen":
             out = lambda: e2gen(sys.argv[3])  # noqa: E731
         elif mode == "e2":
@@ -190,7 +275,9 @@ def main():
     result = {}
     for label, args in (("E1_import_baseline", ["e1"]), ("E2_generate_file", ["e2gen", path]),
                         ("E2_safetensors_materialize", ["e2", path]), ("E3_fp32_to_bf16", ["e3"]),
-                        ("E4_windows_heap_trim", ["e4", path])):
+                        ("E4_windows_heap_trim", ["e4", path]),
+                        ("E5_safetensors_mmap_commit", ["e5", path]),
+                        ("E5b_transformers_header_read", ["e5b", path])):
         r = subprocess.run([sys.executable, "-I", __file__, "--child", *args], capture_output=True, text=True,
                            env={**os.environ, "CUDA_VISIBLE_DEVICES": "-1"})
         line = [x for x in r.stdout.splitlines() if x.startswith("{")]

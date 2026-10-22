@@ -187,6 +187,40 @@ def main():
     add("[transformers] low_cpu_mem_usage は無視される（常に meta 初期化）",
         'kwargs.pop("low_cpu_mem_usage", None)' in mu_text, "transformers/modeling_utils.py")
 
+    # ---- caching_allocator_warmup と safe_open（commit 急増・アクセス違反の調査の根拠）----
+    def line_of(text, needle):
+        for i, ln in enumerate(text.splitlines(), 1):
+            if needle in ln:
+                return i
+        return None
+
+    l_warm_call = line_of(mu_text, "caching_allocator_warmup(model, expanded_device_map, hf_quantizer)")
+    l_warm_cond = line_of(mu_text, "if device_map is not None and not is_hqq_or_quark:")
+    add("[warmup] device_map が指定されたときだけ、重みの読み込み前に呼ばれる（モジュール変数として参照される = 差し替え可能）",
+        l_warm_call is not None and l_warm_cond is not None and l_warm_cond < l_warm_call and l_warm_call - l_warm_cond <= 3,
+        f"modeling_utils.py:{l_warm_cond} -> :{l_warm_call}")
+    add("[warmup] 確保は torch.empty(byte_count // factor, dtype=float16, device=...) の 1 回（factor=2 → モデル全体のバイト数）",
+        "_ = torch.empty(byte_count // factor, dtype=torch.float16, device=device, requires_grad=False)" in mu_text
+        and "factor = 2 if hf_quantizer is None" in mu_text, "modeling_utils.py::caching_allocator_warmup")
+    add("[warmup] 確保量は min(モデルのバイト数, 空き VRAM − 1.2GiB) に制限され、未使用の予約分を差し引く",
+        "byte_count = min(byte_count, max(0, int(device_memory - 1.2 * 1024**3)))" in mu_text
+        and "byte_count = max(0, byte_count - unused_memory)" in mu_text, "modeling_utils.py::caching_allocator_warmup")
+    add("[warmup] アクセラレータ以外（cpu / disk / meta）のデバイスマップでは何も確保しない",
+        "if is_accelerator_device(device)" in mu_text and "if not accelerator_device_map:\n        return" in mu_text,
+        "modeling_utils.py::caching_allocator_warmup")
+    l_miss = line_of(mu_text, "model._move_missing_keys_from_meta_to_cpu(missing_keys + mismatched_keys, dtype, hf_quantizer)")
+    l_init = line_of(mu_text, "model._initialize_missing_keys(missing_keys + mismatched_keys, is_quantized)")
+    add("[ロード順序] 欠損キーの CPU 実体化と初期化（initialize_weights）→ warmup → 重みの読み込み",
+        None not in (l_miss, l_init, l_warm_call) and l_miss < l_init < l_warm_call,
+        f"modeling_utils.py:{l_miss} -> :{l_init} -> :{l_warm_call}")
+    add("[safe_open] 重みの読み込み中に開いたままなのは 1 か所（file_pointer）。ほかは with 内で閉じる",
+        "file_pointer = safe_open(shard_file" in mu_text and "file_pointer.__exit__(None, None, None)" in mu_text
+        and mu_text.count("with safe_open(") == 2 and mu_text.count("= safe_open(") == 1,
+        "modeling_utils.py::_load_state_dict_into_meta_model / load_state_dict / dtype 判定")
+    add("[並列ロード] スレッドプールでの並列ロードは HF_ENABLE_PARALLEL_LOADING が真のときだけ（既定は直列）",
+        'os.environ.get("HF_ENABLE_PARALLEL_LOADING", "").upper() in ENV_VARS_TRUE_VALUES' in mu_text,
+        "modeling_utils.py::_load_pretrained_model")
+
     ok_all = all(c["ok"] for c in checks)
     for c in checks:
         print(f"[{'OK' if c['ok'] else 'NG'}] {c['item']}  ({c['detail']})")

@@ -30,7 +30,7 @@ def tiny_quantized():
 class AdmissionTests(unittest.TestCase):
     def test_safety_floor_is_not_lowered(self):
         self.assertEqual(lp.SAFETY_FLOOR_GB, 3.0)
-        for step in ("b1", "b2", "cd"):
+        for step in ("b1", "b2", "cd", "d0"):
             a = lp.dit_diag_admission(step)
             self.assertAlmostEqual(a["required_free_ram_gb"] - a["consumption_gb"], 3.0, places=1)
 
@@ -42,19 +42,26 @@ class AdmissionTests(unittest.TestCase):
         self.assertFalse(low["ok"])
         self.assertFalse(low["checks"]["free_ram"]["ok"])
 
-    def test_b2_includes_unmeasured_cuda_upper_bound(self):
+    def test_b2_uses_previous_cuda_measurement(self):
         a = lp.dit_diag_admission("b2")
-        self.assertAlmostEqual(a["consumption_gb"], lp.IMPORT_FULL_PRIVATE_GB + lp.CUDA_HOST_UPPER_GB, places=2)
+        self.assertAlmostEqual(a["consumption_gb"], lp.CUDA_BASE_PHYS_MEASURED_GB, places=2)       # 物理（実測 3.40GB）
+        self.assertAlmostEqual(a["commit_consumption_gb"], lp.CUDA_BASE_PRIVATE_MEASURED_GB, places=2)  # commit（実測 6.38GB）
+        self.assertEqual(lp.CUDA_BASE_PHYS_MEASURED_GB, 3.40)
 
-    def test_b2_uses_b1_physical_measurement_when_available(self):
-        a = lp.dit_diag_admission("b2", measured={"b1_phys_gb": 0.9})
-        self.assertAlmostEqual(a["consumption_gb"], 0.9 + lp.CUDA_HOST_UPPER_GB, places=2)  # 空き RAM 判定は物理
-        self.assertAlmostEqual(a["commit_consumption_gb"], lp.IMPORT_FULL_PRIVATE_GB + lp.CUDA_HOST_UPPER_GB, places=2)
+    def test_d0_is_small_and_independent_of_dit(self):
+        d0 = lp.dit_diag_admission("d0")
+        cd = lp.dit_diag_admission("cd")
+        self.assertLess(d0["required_commit_headroom_gb"], cd["required_commit_headroom_gb"])
+        self.assertLess(d0["required_free_vram_mib"], cd["required_free_vram_mib"])
+        # 現状の commit 余裕（約 18〜19GB）・空き RAM（約 7〜8GB）で許可される規模であること
+        ok = lp.dit_diag_admission("d0", avail_gb=7.2, commit_headroom_gb=18.0, free_vram_mib=6400)
+        self.assertTrue(ok["ok"], ok.get("checks"))
 
-    def test_cd_uses_upper_bounds_until_b2_is_measured(self):
+    def test_cd_uses_previous_b2_measurement_until_rerun(self):
         need = lp.STAGE_NEED_GB["dit_gpu_direct"]
         no_b2 = lp.dit_diag_admission("cd")
-        self.assertAlmostEqual(no_b2["consumption_gb"], 2.553 + 1.0 + need, places=2)
+        self.assertAlmostEqual(no_b2["consumption_gb"], 3.40 + need, places=2)
+        self.assertAlmostEqual(no_b2["commit_consumption_gb"], 6.38 + lp.DIT_COMMIT_PEAK_OBSERVED_GB, places=2)
         with_b2 = lp.dit_diag_admission("cd", measured={"b2_phys_after_cuda_gb": 1.5, "b2_private_after_cuda_gb": 2.9,
                                                         "ctx_vram_mib": 300})
         self.assertAlmostEqual(with_b2["consumption_gb"], 1.5 + need, places=2)           # 物理消費で空き RAM を判定
@@ -176,6 +183,24 @@ class ParamSummaryTests(unittest.TestCase):
         q = s["by_kind"]["int8(AffineQuantizedTensor)"]
         self.assertEqual(q["count"], 2)
         self.assertEqual(q["bytes"], 2 * 128 * 128)  # int8 は 1 バイト/要素
+
+
+class DiagOptionTests(unittest.TestCase):
+    def test_parse_steps_and_path(self):
+        import dit_diag as dd
+        self.assertEqual(dd.parse_steps([]), ("b1", "b2", "cd"))
+        self.assertEqual(dd.parse_steps(["--steps=d0"]), ("d0",))
+        self.assertEqual(dd.parse_steps(["--steps=b2,cd"]), ("b2", "cd"))
+        with self.assertRaises(SystemExit):
+            dd.parse_steps(["--steps=zz"])
+        self.assertEqual(dd.parse_path([]), "gpu-direct")
+        self.assertEqual(dd.parse_path(["--path=cpu-via"]), "cpu-via")
+        with self.assertRaises(SystemExit):
+            dd.parse_path(["--path=bogus"])
+
+    def test_probe_accepts_d0_step_and_synthetic_helpers_exist(self):
+        self.assertTrue(callable(dp.step_d0))
+        self.assertTrue(callable(dp.install_load_instrumentation))
 
 
 class DitOnlyPatchTests(unittest.TestCase):

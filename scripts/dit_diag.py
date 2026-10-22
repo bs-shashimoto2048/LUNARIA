@@ -36,7 +36,31 @@ ROOT = p0.ROOT
 LOGS = p0.LOGS
 STAGE = "DIT_DIAG"
 PROBE = ROOT / "scripts" / "dit_probe.py"
-TIMEOUTS = {"b1": 300, "b2": 300, "cd": 900}
+TIMEOUTS = {"b1": 300, "b2": 300, "cd": 900, "d0": 300}
+VALID_STEPS = ("b1", "b2", "cd", "d0")
+
+
+def parse_steps(argv):
+    """--steps b1,b2,cd（既定）または d0 など。無効な指定は拒否する。"""
+    for a in argv:
+        if a.startswith("--steps="):
+            steps = tuple(x for x in a.split("=", 1)[1].split(",") if x)
+            bad = [s for s in steps if s not in VALID_STEPS]
+            if bad or not steps:
+                raise SystemExit(f"無効な --steps: {bad or '空'}（有効: {','.join(VALID_STEPS)}）")
+            return steps
+    return ("b1", "b2", "cd")
+
+
+def parse_path(argv):
+    """--path=gpu-direct（既定。D1 / --disable-warmup で D2）または --path=cpu-via（D3: 従来の CPU 経由ロード）。"""
+    for a in argv:
+        if a.startswith("--path="):
+            p = a.split("=", 1)[1]
+            if p not in ("gpu-direct", "cpu-via"):
+                raise SystemExit(f"無効な --path: {p}")
+            return p
+    return "gpu-direct"
 MB = 1048576
 
 
@@ -102,6 +126,7 @@ def run_child(step, run_id, results):
     env["PYTHONFAULTHANDLER"] = "1"  # ネイティブクラッシュ（アクセス違反）の Python 側スタックをログへ出す
     if "--disable-warmup" in sys.argv:  # 既定オフ。caching_allocator_warmup を無効化して commit の急増を避けられるか確認する用
         env["LUNARIA_DISABLE_WARMUP"] = "1"
+    env["LUNARIA_DIT_PATH"] = parse_path(sys.argv)  # gpu-direct（D1/D2）または cpu-via（D3）
     py = ROOT / ".venv-engine" / "Scripts" / "python.exe"
     before = {"resources": current_resources(), "vram": vram_state()}
     logf = open(log, "wb")
@@ -151,8 +176,11 @@ def main():
     p0.ABORT_FREE_RAM_GB = lp.SAFETY_FLOOR_GB  # 外側の監視: 空き RAM がこれ未満で所有プロセスのみ停止
     LOGS.mkdir(parents=True, exist_ok=True)
     out_file = LOGS / (f"dit_diag_dry_{run_id}.json" if dry else f"dit_diag_{run_id}.json")
+    steps = parse_steps(sys.argv)
     R = {"run_id": run_id, "mode": "dry-run" if dry else "run", "started": time.strftime("%Y-%m-%d %H:%M:%S"),
-         "generation": "NOT RUN", "lm_te_vae": "NOT INITIALIZED", "steps": {}, "admission": {}}
+         "generation": "NOT RUN", "lm_te_vae": "NOT INITIALIZED", "steps": {}, "admission": {},
+         "options": {"steps": list(steps), "path": parse_path(sys.argv),
+                     "disable_warmup": "--disable-warmup" in sys.argv}}
     st = None
     if not dry:
         st = p0.State()
@@ -186,7 +214,7 @@ def main():
 
     # 判定のみ（--dry-run）: 現在の資源で各ステップの許可判定を記録して終了
     if dry:
-        for s in ("b1", "b2", "cd"):
+        for s in steps:
             admit(s)
         R["status"] = "dry_run_done"
         save()
@@ -197,7 +225,7 @@ def main():
         return finish(R, st, save, 0)
 
     status, rc = "ok", 0
-    for step in ("b1", "b2", "cd"):
+    for step in steps:
         a = admit(step)
         if not a["ok"]:
             bad = [f"{k}: {c['detail']}" for k, c in a["checks"].items() if not c["ok"]]
@@ -227,10 +255,11 @@ def main():
             status, rc = R["status"], 1
             break
     else:
-        cd = (R["steps"].get("cd") or {}).get("result") or {}
-        R["status"] = "ok" if cd.get("status") == "ok" else f"completed_with_{cd.get('status')}"
+        last = steps[-1]
+        lr = (R["steps"].get(last) or {}).get("result") or {}
+        R["status"] = "ok" if lr.get("status") == "ok" else f"completed_with_{lr.get('status')}"
         status = R["status"]
-        rc = 0 if cd.get("status") == "ok" else 1
+        rc = 0 if lr.get("status") == "ok" else 1
     R["runner_private_mb_end"] = round(psutil.Process().memory_info().private / MB)
     R["final_resources"] = current_resources()
     save()
