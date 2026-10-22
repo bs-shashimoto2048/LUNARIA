@@ -10,7 +10,7 @@
 
 ## 1. 要点
 
-1. **物理 RAM で最大の固定費は CUDA コンテキスト（約 2.6GB）**。import は約 0.7〜0.8GB。モデルを 1 つも読む前に、**約 3.4GB の物理 RAM**を消費する [実測]
+1. **物理 RAM の固定費は、`acestep.handler` を import した後の CUDA 初期化で約 2.6GB**。import は約 0.7〜0.8GB。モデルを 1 つも読む前に、**約 3.4GB の物理 RAM**を消費する [実測]。**（訂正）後の D0 で、torch のみを import した後の CUDA 初期化は +306MB（物理 約 0.1〜0.3GB）だと分かった。つまり 2.6GB は CUDA そのものではなく、import した何かが原因。`PHASE0_D0_RESULTS.md` を参照**
 2. 従来使っていた `private`（commit 量）は**物理消費を過大評価する**。`import numpy` だけで private は約 780MB 増えるが RSS は増えない（OpenBLAS の予約）[実測]。以降、空き RAM の判定には物理消費（`available` の低下量と RSS 増加の大きい方）、commit 余裕の判定には private を使う
 3. **DiT の GPU 直接ロードは、`torch_cpu.dll` のアクセス違反（0xC0000005）で失敗した**。物理 RAM は 4.3GB 以上を維持しており、メモリ中断ではない [実測]
 4. ロード開始と同時に、**プロセスの commit が 6.5GB → 20.3GB へ急増**した。開始前のシステム commit 余裕は 16.3GB で、急増分（+13.8GB）が余裕を超えていた。**ただしクラッシュは急増が収まった約 3〜4 秒後**で、commit 上限の超過は**仮説の一つ**にとどまる [推定]。**（訂正）当初は「有力」としたが、`PHASE0_COMMIT_SPIKE_INVESTIGATION.md` で時系列と CPU のみの実測（safetensors のマッピングが commit に計上される）を精査し、格下げした**

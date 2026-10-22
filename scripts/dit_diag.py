@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -109,6 +110,104 @@ def step_a():
     return r
 
 
+class SysMonitor(threading.Thread):
+    """ランナー側の高頻度システム監視（0.1 秒、GlobalMemoryStatusEx のみ）。
+
+    子プロセスの Python サンプラーは、GIL を保持するネイティブ呼び出し（例: safetensors の save_file）の間は止まる
+    （D0 で 4.39 秒の空白を実測）。ランナーは別プロセスなので影響を受けず、システム全体の空き RAM と commit 余裕を
+    途切れずに記録できる。nvidia-smi のような重い処理は行わない（VRAM は 1 秒周期の Monitor と子プロセス内で記録）。
+    """
+
+    def __init__(self, path, status_fn=None, interval=0.1):
+        super().__init__(daemon=True)
+        self.path = Path(path)
+        self.status_fn = status_fn or p0.fast_status
+        self.interval = interval
+        self.stop_flag = False
+        self.samples = 0
+        self.max_gap = 0.0
+        self.min_avail = 1e9
+        self.min_commit = 1e9
+        self.cost_total = 0.0
+
+    def tick(self, f=None):
+        t0 = time.perf_counter()
+        avail, load, commit = self.status_fn()
+        self.min_avail = min(self.min_avail, avail)
+        self.min_commit = min(self.min_commit, commit)
+        self.samples += 1
+        if f is not None:
+            f.write(json.dumps({"t": round(time.time(), 3), "avail_gb": round(avail, 3), "commit_headroom_gb": commit},
+                               separators=(",", ":")) + "\n")
+            f.flush()
+        self.cost_total += time.perf_counter() - t0
+
+    def run(self):
+        last = None
+        with open(self.path, "a", encoding="utf-8") as f:
+            while not self.stop_flag:
+                t = time.perf_counter()
+                if last is not None:
+                    self.max_gap = max(self.max_gap, t - last)
+                last = t
+                self.tick(f)
+                time.sleep(max(0.0, self.interval - (time.perf_counter() - t)))
+
+    def summary(self):
+        return {"samples": self.samples, "interval_target_s": self.interval, "interval_max_s": round(self.max_gap, 3),
+                "tick_cost_mean_ms": round(1000 * self.cost_total / max(1, self.samples), 4),
+                "min_avail_gb": None if self.min_avail == 1e9 else round(self.min_avail, 3),
+                "min_commit_headroom_gb": None if self.min_commit == 1e9 else round(self.min_commit, 2)}
+
+
+def _sanitize(text):
+    """ログに含まれる個人情報（ユーザー名つきのパス）を伏せる。"""
+    import re
+    s = str(text).replace(str(ROOT), "<ROOT>")
+    return re.sub(r"([A-Za-z]:\\Users\\)[^\\\s]+", r"\1<USER>", s)
+
+
+def collect_crash_info(t_start, t_end, log_path):
+    """子プロセスが異常終了したときの、Windows イベントログ（Application Error / WER）と faulthandler の記録を保存する。
+
+    読み取りのみ。自動再試行はしない。結果はローカル（Git 管理外）の結果ファイルに入り、公開文書には要点だけを書く。
+    """
+    import datetime
+    import re
+    out = {"events": [], "faulthandler_tail": []}
+    fmt = "%Y-%m-%d %H:%M:%S"
+    s = datetime.datetime.fromtimestamp(t_start - 5).strftime(fmt)
+    e = datetime.datetime.fromtimestamp(t_end + 90).strftime(fmt)
+    ps = ("$ev = Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date 'START'); EndTime=(Get-Date 'END')} "
+          "-ErrorAction SilentlyContinue | Where-Object { $_.ProviderName -match 'Application Error|Windows Error Reporting' } | "
+          "ForEach-Object { [pscustomobject]@{Time=$_.TimeCreated.ToString('HH:mm:ss.fff'); Provider=$_.ProviderName; "
+          "Id=$_.Id; Message=$_.Message} }; if ($ev) { $ev | ConvertTo-Json -Compress -Depth 3 } else { '[]' }"
+          ).replace("START", s).replace("END", e)
+    try:
+        raw = subprocess.check_output(["powershell", "-NoProfile", "-Command", ps], text=True, timeout=60,
+                                      encoding="utf-8", errors="replace")
+        data = json.loads(raw) if raw.strip() else []
+        if isinstance(data, dict):
+            data = [data]
+        keep = re.compile(r"例外コード|Exception code|フォールト オフセット|Fault offset|障害が発生したモジュール|Faulting module|"
+                          r"障害が発生しているアプリケーション|Faulting application|P4:|P7:|P8:|イベント名|Event Name")
+        for ev in data:
+            lines = [_sanitize(x.strip()) for x in str(ev.get("Message", "")).splitlines() if keep.search(x)]
+            out["events"].append({"time": ev.get("Time"), "provider": ev.get("Provider"), "id": ev.get("Id"),
+                                  "summary": lines[:12]})
+    except Exception as ex:
+        out["events_error"] = f"{type(ex).__name__}: {str(ex)[:200]}"
+    try:
+        txt = Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        idx = [i for i, ln in enumerate(txt) if "fatal exception" in ln.lower() or "Fatal Python" in ln]
+        tail = txt[idx[0]:idx[0] + 40] if idx else []
+        out["faulthandler_tail"] = [_sanitize(x)[:240] for x in tail]
+        out["faulthandler_found"] = bool(idx)
+    except Exception as ex:
+        out["faulthandler_error"] = f"{type(ex).__name__}: {str(ex)[:200]}"
+    return out
+
+
 def run_child(step, run_id, results):
     """子プロセスを所有プロセスとして起動し、外側からも RAM を監視する。自動再試行はしない。"""
     out = LOGS / f"dit_probe_{run_id}_{step}.json"
@@ -139,6 +238,8 @@ def run_child(step, run_id, results):
     mon = p0.Monitor(proc.pid, f"dit_{step}")
     mon.phase = step
     mon.start()
+    sysmon = SysMonitor(LOGS / f"dit_sys_{run_id}_{step}.jsonl")  # 子の GIL に左右されない 0.1 秒のシステム監視
+    sysmon.start()
     info = {"step": step, "owned_pid": proc.pid, "before": before, "result_file": out.name, "log_file": log.name}
     try:
         while proc.poll() is None:
@@ -151,6 +252,8 @@ def run_child(step, run_id, results):
             time.sleep(1)
     finally:
         mon.stop_flag = True
+        sysmon.stop_flag = True
+        info["sys_monitor"] = sysmon.summary()
         info["perf"] = mon.snapshot_and_reset()
         info["wall_seconds"] = round(time.time() - t0, 1)
         info["stop"] = p0.stop_owned(proc)  # 既に終了していれば何もしない。生きていれば所有 PID のみ停止
@@ -162,6 +265,9 @@ def run_child(step, run_id, results):
         info["vram_after_minus_before_mib"] = info["after"]["vram"]["used_mib"] - before["vram"]["used_mib"]
         info["orphans"] = [x for x in info["stop"]["pids"] if psutil.pid_exists(x)]
         info["residual_after"] = p0.residual_engine_procs()
+        if info["exit_code"] not in (0, 1, 3, None):  # 0xC0000005 などのネイティブクラッシュ: 記録を保存（再試行はしない）
+            info["access_violation"] = info["exit_code"] in (3221225477, -1073741819)
+            info["crash_info"] = collect_crash_info(t0, time.time(), log)
     try:
         info["result"] = json.loads(out.read_text(encoding="utf-8")) if out.exists() else None
     except Exception as e:

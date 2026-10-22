@@ -36,6 +36,7 @@ Windows 11 / RTX 4070 Laptop GPU（8GB）/ Python 3.11.17（uv）/ PyTorch 2.7.1
 B′ の初期化ピーク RAM の削減（実ソース解析・実測・候補比較）: `docs/PHASE0_INIT_MEMORY_OPTIMIZATION.md`。
 DiT 単独の段階的 GPU 診断の結果（CUDA コンテキストの実測、GPU 直接ロードのクラッシュ分析）: `docs/PHASE0_DIT_DIAGNOSTIC.md`。
 DiT ロード時の commit 急増・アクセス違反の調査（warmup、safetensors のマッピング、D0〜D3 の比較）: `docs/PHASE0_COMMIT_SPIKE_INVESTIGATION.md`。
+D0（合成 GPU 診断）の結果（commit の計上機構 M1・M2 の実測）: `docs/PHASE0_D0_RESULTS.md`。
 互換性・ライセンス（`PHASE0_COMPATIBILITY.md`）は未作成。ACE-Step 本体は MIT、モデルカードも MIT。
 
 ## 取得とセットアップ（概要）

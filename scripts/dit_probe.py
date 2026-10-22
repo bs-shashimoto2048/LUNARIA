@@ -228,6 +228,18 @@ class SelfMonitor(threading.Thread):
         self.max_gap = 0.0
         self.sum_gap = 0.0
         self.tick_cost_total = 0.0
+        self.reset_window()
+
+    def reset_window(self):
+        """工程ごとの「処理中の最大値」を取るための区間統計をリセットする。"""
+        self._w = {"max_private": 0, "min_commit": 1e9, "min_avail": 1e9, "max_vram": None, "samples": 0}
+
+    def window_summary(self):
+        w = self._w
+        return {"max_private_mb": round(w["max_private"] / MB),
+                "min_commit_headroom_gb": None if w["min_commit"] == 1e9 else round(w["min_commit"], 3),
+                "min_avail_gb": None if w["min_avail"] == 1e9 else round(w["min_avail"], 3),
+                "max_vram_used_mb": w["max_vram"], "samples": w["samples"]}
 
     def tick(self):
         t0 = time.perf_counter()
@@ -245,6 +257,13 @@ class SelfMonitor(threading.Thread):
         self.max_rss = max(self.max_rss, rss)
         self.min_avail = min(self.min_avail, a)
         self.min_commit = min(self.min_commit, c)
+        w = self._w
+        w["max_private"] = max(w["max_private"], pv)
+        w["min_commit"] = min(w["min_commit"], c)
+        w["min_avail"] = min(w["min_avail"], a)
+        if vram is not None:
+            w["max_vram"] = vram if w["max_vram"] is None else max(w["max_vram"], vram)
+        w["samples"] += 1
         self._ticks += 1
         row = {"t": round(time.time(), 3), "step": self.step, "private_mb": round(pv / MB), "rss_mb": round(rss / MB),
                "avail_gb": round(a, 2), "commit_headroom_gb": round(c, 2)}
@@ -429,13 +448,73 @@ def run(step, out):
     return 0 if res.get("status") == "ok" else 1
 
 
-def step_d0(res, mon, save):
-    """D0: モデルなしの合成 CUDA 確保と safe_open(device=cuda) の検証（最大 1GiB）。
+def sync_point(label, **kw):
+    """重要な確保・解放の直前直後に行う同期的な計測。0.1 秒間隔のサンプラーが取りこぼす短時間の変化も、この時点の値は確実に残る。"""
+    return event(label, vram_used_mb=vram_used_mb(), avail_gb=round(avail_gb(), 3), **kw)
 
-    DiT 診断で観測した commit の急増が、(M1) safetensors のファイルマッピング、(M2) CUDA の大きな確保（WDDM）、のどちらに
-    由来するかを、実 DiT を使わずに切り分ける。各操作の前後の private / commit 余裕を、イベントと高頻度サンプルで記録する。
-    transformers が行う順序（warmup 相当の大きな確保 → 解放 → safe_open(device=cuda) で 1 テンソルずつ GPU へ）を小さく再現し、
-    safetensors の CUDA 直接読み込みがこの環境で単独でアクセス違反を起こすかも確認する。
+
+def d0_budget(need_ram_gb, need_commit_gb):
+    """工程の直前にメモリ予算を再評価する。物理の空き・commit 余裕の両方で、確保後も安全下限（3GB）を保てるか。"""
+    a, c = avail_gb(), commit_headroom_gb()
+    ok = (a - need_ram_gb >= FLOOR_GB) and (c - need_commit_gb >= FLOOR_GB)
+    return ok, {"avail_gb": round(a, 3), "commit_headroom_gb": round(c, 3), "need_ram_gb": round(need_ram_gb, 3),
+                "need_commit_gb": round(need_commit_gb, 3), "floor_gb": FLOOR_GB}
+
+
+def d0_deltas(rec):
+    """pre を基準にした、処理後・処理中の最大・解放後の増分（private / system commit / VRAM）。"""
+    pre, post, win = rec["pre"], rec["post"], rec["window"]
+    d = {"private_post_mb": post["private_mb"] - pre["private_mb"],
+         "private_window_max_mb": win["max_private_mb"] - pre["private_mb"],
+         "commit_post_gb": round(pre["commit_headroom_gb"] - post["commit_headroom_gb"], 3),
+         "commit_window_max_gb": (None if win["min_commit_headroom_gb"] is None
+                                  else round(pre["commit_headroom_gb"] - win["min_commit_headroom_gb"], 3)),
+         "avail_post_drop_gb": round(pre["avail_gb"] - post["avail_gb"], 3)}
+    if pre.get("vram_used_mb") is not None and post.get("vram_used_mb") is not None:
+        d["vram_post_mb"] = post["vram_used_mb"] - pre["vram_used_mb"]
+        d["vram_window_max_mb"] = (None if win["max_vram_used_mb"] is None
+                                   else win["max_vram_used_mb"] - pre["vram_used_mb"])
+    rel = rec.get("released")
+    if rel:
+        d["private_released_mb"] = rel["private_mb"] - pre["private_mb"]
+        d["commit_released_gb"] = round(pre["commit_headroom_gb"] - rel["commit_headroom_gb"], 3)
+        if pre.get("vram_used_mb") is not None and rel.get("vram_used_mb") is not None:
+            d["vram_released_mb"] = rel["vram_used_mb"] - pre["vram_used_mb"]
+    return d
+
+
+def d0_stage(name, mon, fn, release=None, settle_s=0.4):
+    """1 工程を、前・処理中の最大・後・解放後・所要時間・エラーつきで記録する（実行は独立した 1 工程）。"""
+    rec = {"name": name, "pre": sync_point(f"{name}:pre")}
+    mon.step = name
+    mon.reset_window()
+    t0 = time.perf_counter()
+    try:
+        rec["result"], rec["error"] = fn(), None
+    except BaseException as e:  # CUDA エラー・確保失敗も記録して、成功扱いにしない
+        rec["result"], rec["error"] = None, f"{type(e).__name__}: {str(e)[:300]}"
+    rec["seconds"] = round(time.perf_counter() - t0, 3)
+    time.sleep(settle_s)  # サンプラーに処理直後の状態を捉えさせる
+    rec["post"] = sync_point(f"{name}:post")
+    rec["window"] = mon.window_summary()
+    if release is not None:
+        try:
+            release()
+            rec["release_error"] = None
+        except BaseException as e:
+            rec["release_error"] = f"{type(e).__name__}: {str(e)[:300]}"
+        time.sleep(settle_s)
+        rec["released"] = sync_point(f"{name}:released")
+    rec["deltas"] = d0_deltas(rec)
+    return rec
+
+
+def step_d0(res, mon, save):
+    """D0: モデルなしの合成 GPU 診断（実 DiT・LM・Text Encoder・VAE・INT8・楽曲生成は行わない）。
+
+    DiT 診断で観測した commit の急増が、(M1) safetensors のファイルマッピング、(M2) CUDA の大きな確保、のどちらに
+    由来するかを切り分け、`safe_open(device="cuda")` が単独でアクセス違反を起こすかを確認する。
+    工程は独立し、各工程の前に予算を再評価する。安全な順（CUDA の小さな確保 → CPU の safetensors → CUDA の safetensors）で進める。
     """
     mon.step = "import"
     import torch
@@ -443,68 +522,179 @@ def step_d0(res, mon, save):
     from safetensors.torch import save_file
     res["import_torch"] = mem()
     mon.step = "cuda_init"
+    sync_point("cuda_init:pre")
     res["cuda_init"] = cuda_init_stage()
+    sync_point("cuda_init:post")
     res["private_after_cuda_gb"] = round(res["cuda_init"]["after"]["private_mb"] / 1024, 3)
     res["phys_after_cuda"] = phys_since_start()
+    stages, holder = [], {}
+    res["d0_stages"] = stages
+    res["budget_stops"] = []
     save()
 
-    def at(label, **kw):
-        row = event(label, vram_used_mb=vram_used_mb(), **kw)
-        time.sleep(0.5)  # 高頻度サンプラー（0.1 秒）に確実に捉えさせる
-        return row
+    def run_stage(name, fn, release=None, need_ram_gb=0.3, need_commit_gb=1.0):
+        ok, b = d0_budget(need_ram_gb, need_commit_gb)
+        if not ok:
+            res["budget_stops"].append({"stage": name, **b})
+            return None
+        rec = d0_stage(name, mon, fn, release)
+        rec["budget"] = b
+        stages.append(rec)
+        save()
+        return rec
 
+    # ---- A. CUDA の合成確保（小さい容量から段階的に。各段階の前に予算を再評価。warmup と同じ torch.empty(fp16) の形式）----
+    for size_mib in (64, 128, 256, 512, 1024):
+        gib = size_mib / 1024
+
+        def alloc(size_mib=size_mib):
+            holder["x"] = torch.empty(size_mib * MB // 2, dtype=torch.float16, device="cuda")
+            torch.cuda.synchronize()
+            return {"size_mib": size_mib, "reserved_mb": round(torch.cuda.memory_reserved(0) / MB)}
+
+        def free():
+            holder.pop("x", None)
+            torch.cuda.empty_cache()
+
+        rec = run_stage(f"cuda_alloc_{size_mib}MiB", alloc, free, need_ram_gb=0.3, need_commit_gb=3.0 * gib)
+        if rec is None or rec["error"]:
+            break
+
+    # ---- B. 小さな確保の積み重ね（transformers の warmup 無効時のパラメータごとの確保に相当）: 32MiB × 16 = 512MiB ----
+    def alloc_many():
+        holder["many"] = [torch.empty(32 * MB // 2, dtype=torch.float16, device="cuda") for _ in range(16)]
+        torch.cuda.synchronize()
+        return {"count": 16, "each_mib": 32}
+
+    def free_many():
+        holder.pop("many", None)
+        torch.cuda.empty_cache()
+
+    run_stage("cuda_alloc_many_32MiBx16", alloc_many, free_many, need_commit_gb=1.5)
+
+    # ---- C. 合成 safetensors（256MiB）の作成 ----
     work = ROOT / "data" / "logs" / "d0_tmp"
     work.mkdir(parents=True, exist_ok=True)
     path = work / "d0_synthetic.safetensors"
+    n_t, elems = 8, 16 * MB  # bf16 で 32MiB × 8 = 256MiB
+
+    def make_file():
+        tensors = {f"w{i}": torch.randn(elems, dtype=torch.bfloat16) for i in range(n_t)}
+        save_file(tensors, str(path))
+        holder["ref0"] = tensors["w0"].clone()  # CUDA 読み込みの正しさの照合用（32MiB）
+        return {"file_mb": round(path.stat().st_size / MB)}
+
     try:
-        n_t, elems = 8, 16 * MB  # bf16 で 32MiB × 8 = 256MiB
-        save_file({f"w{i}": torch.randn(elems, dtype=torch.bfloat16) for i in range(n_t)}, str(path))
-        settle(1.0)
-        res["synthetic_file_mb"] = round(path.stat().st_size / MB)
+        run_stage("make_synthetic_file", make_file, lambda: gc.collect(), need_ram_gb=0.8, need_commit_gb=1.0)
+        res["synthetic_file_mb"] = round(path.stat().st_size / MB) if path.exists() else None
+        if path.exists():
+            # ---- D. safetensors CPU: 開く / get_slice ----
+            def cpu_open():
+                holder["f_cpu"] = safe_open(str(path), framework="pt", device="cpu")
+                holder["slices"] = [holder["f_cpu"].get_slice(k) for k in holder["f_cpu"].keys()]
+                return {"keys": len(holder["slices"])}
 
-        mon.step = "D0_alloc"
-        torch.cuda.reset_peak_memory_stats(0)
-        at("d0_base")
-        x1 = torch.empty(128 * MB // 2, dtype=torch.float16, device="cuda")   # 128MiB（warmup と同じ形式の 1 回の確保）
-        at("d0_alloc_128MiB")
-        x2 = torch.empty(512 * MB // 2, dtype=torch.float16, device="cuda")   # 512MiB
-        at("d0_alloc_512MiB")
-        del x1, x2
-        at("d0_free_python_ref")
-        torch.cuda.empty_cache()
-        at("d0_empty_cache")
+            def cpu_close():
+                holder.pop("slices", None)
+                holder.pop("f_cpu").__exit__(None, None, None)
 
-        mon.step = "D0_safe_open_cuda"
-        warm = torch.empty(256 * MB // 2, dtype=torch.float16, device="cuda")  # warmup 相当（モデルのバイト数 1 回の確保）
-        at("d0_warmup_like_256MiB")
-        del warm  # transformers も確保後すぐ参照を落とす（割り当てはキャッシュに残る）
-        at("d0_warmup_like_freed")
-        f = safe_open(str(path), framework="pt", device="cuda:0")             # transformers と同じ開き方
-        at("d0_safe_open_cuda_opened")
-        loaded = {}
-        for k in f.keys():
-            loaded[k] = f.get_slice(k)[...]                                    # 1 テンソルずつ GPU へ（transformers と同じ）
-        torch.cuda.synchronize()
-        at("d0_tensors_on_gpu", devices=sorted({str(t.device) for t in loaded.values()}))
-        f.__exit__(None, None, None)
-        at("d0_safe_open_closed")
-        ok_values = all(bool(torch.isfinite(t.float()).all()) for t in loaded.values())
-        res["d0_values_finite"] = ok_values
-        del loaded
-        torch.cuda.empty_cache()
-        at("d0_cleanup")
-        res["status"] = "ok" if ok_values else "d0_bad_values"
+            run_stage("st_cpu_open_get_slice", cpu_open, cpu_close, need_commit_gb=1.0)
+
+            # ---- E. safetensors CPU: 実体化（[...]）----
+            def cpu_materialize():
+                f = safe_open(str(path), framework="pt", device="cpu")
+                holder["f_cpu"] = f
+                holder["t_cpu"] = [f.get_slice(k)[...] for k in f.keys()]
+                return {"tensors": len(holder["t_cpu"]), "device": str(holder["t_cpu"][0].device)}
+
+            def cpu_materialize_release():
+                holder.pop("t_cpu", None)
+                holder.pop("f_cpu").__exit__(None, None, None)
+                gc.collect()
+
+            run_stage("st_cpu_materialize", cpu_materialize, cpu_materialize_release, need_commit_gb=1.5)
+
+            # ---- F. 同じファイルの 3 重オープン（マッピングの多重度と commit の関係）----
+            def multi_open():
+                holder["multi"] = [safe_open(str(path), framework="pt", device="cpu") for _ in range(3)]
+                return {"opens": 3}
+
+            def multi_close():
+                for h in holder.pop("multi"):
+                    h.__exit__(None, None, None)
+
+            run_stage("st_cpu_open_x3", multi_open, multi_close, need_commit_gb=2.5)
+
+            # ---- G. safetensors CUDA: safe_open(device="cuda:0") で 1 テンソルずつ GPU へ（transformers と同じ手順）----
+            def cuda_open_load():
+                f = safe_open(str(path), framework="pt", device="cuda:0")
+                holder["f_cuda"] = f
+                holder["t_cuda"] = {}
+                for i, k in enumerate(f.keys()):
+                    sync_point(f"st_cuda_tensor_{i}:pre")
+                    holder["t_cuda"][k] = f.get_slice(k)[...]
+                    sync_point(f"st_cuda_tensor_{i}:post")
+                torch.cuda.synchronize()
+                t0c = holder["t_cuda"]["w0"]
+                return {"tensors": len(holder["t_cuda"]), "device": str(t0c.device),
+                        "values_equal_to_cpu_reference": bool(torch.equal(t0c.cpu(), holder["ref0"])),
+                        "all_finite": all(bool(torch.isfinite(t.float()).all()) for t in holder["t_cuda"].values())}
+
+            def cuda_open_release():
+                holder.pop("t_cuda", None)
+                holder.pop("f_cuda").__exit__(None, None, None)
+                torch.cuda.empty_cache()
+
+            rec_g = run_stage("st_cuda_open_load", cuda_open_load, cuda_open_release, need_commit_gb=2.0)
+
+            # ---- H. transformers と同じ順序: warmup 相当の確保 → 解放 → safe_open(cuda) で読み込み ----
+            if rec_g is not None and not rec_g["error"]:
+                def warm_then_load():
+                    w = torch.empty(256 * MB // 2, dtype=torch.float16, device="cuda")  # warmup 相当（モデルのバイト数 1 回）
+                    torch.cuda.synchronize()
+                    sync_point("warmup_like_alloc:post")
+                    del w
+                    sync_point("warmup_like_alloc:freed_ref")
+                    f = safe_open(str(path), framework="pt", device="cuda:0")
+                    holder["f_cuda"] = f
+                    holder["t_cuda"] = {k: f.get_slice(k)[...] for k in f.keys()}
+                    torch.cuda.synchronize()
+                    return {"tensors": len(holder["t_cuda"])}
+
+                run_stage("warmup_like_then_cuda_open_load", warm_then_load, cuda_open_release, need_commit_gb=3.0)
     finally:
+        holder.clear()
         try:
             path.unlink()
             work.rmdir()
         except OSError:
             pass
-    # 機構の切り分け用に、各イベントの private / commit 余裕を基準（d0_base）との差で整理する
-    base = next(e for e in EVENTS if e["event"] == "d0_base")
-    res["d0_deltas"] = [{"event": e["event"], "private_delta_mb": e["private_mb"] - base["private_mb"],
-                         "commit_headroom_delta_gb": round(e["commit_headroom_gb"] - base["commit_headroom_gb"], 3),
-                         "vram_used_mb": e.get("vram_used_mb")} for e in EVENTS if e["event"].startswith("d0_")]
+    errors = [s["name"] for s in stages if s["error"] or s.get("release_error")]
+    res["d0_errors"] = errors
+    # M1 / M2 の指標（commit 増分 ÷ 対象サイズ）。1 に近ければ「そのサイズ分が commit に計上された」
+    ind = {}
+    for s in stages:
+        d = s["deltas"]
+        n = s["name"]
+        if n.startswith("cuda_alloc_") and "MiB" in n and "many" not in n:
+            ind[n] = {"commit_post_over_size": round(d["commit_post_gb"] / (int(n.split("_")[2][:-3]) / 1024), 3),
+                      "commit_window_max_over_size": None if d["commit_window_max_gb"] is None else round(
+                          d["commit_window_max_gb"] / (int(n.split("_")[2][:-3]) / 1024), 3)}
+        elif n.startswith("st_") or n == "cuda_alloc_many_32MiBx16" or n.startswith("warmup_like"):
+            base_gib = 0.5 if n == "cuda_alloc_many_32MiBx16" else 0.25
+            ind[n] = {"commit_post_over_size": round(d["commit_post_gb"] / base_gib, 3),
+                      "commit_window_max_over_size": None if d["commit_window_max_gb"] is None else round(
+                          d["commit_window_max_gb"] / base_gib, 3)}
+    res["d0_indicators"] = ind
+    g = next((s for s in stages if s["name"] == "st_cuda_open_load"), None)
+    values_ok = bool(g and g["result"] and g["result"]["values_equal_to_cpu_reference"] and g["result"]["all_finite"])
+    res["d0_cuda_values_ok"] = values_ok
+    if errors:
+        res["status"] = "d0_stage_error"
+    elif res["budget_stops"]:
+        res["status"] = "ok_budget_stopped"  # 予算が足りず一部の工程を実施しなかった（安全側の停止）。失敗ではない
+    else:
+        res["status"] = "ok" if values_ok else "d0_values_mismatch"
 
 
 def step_cd(res, mon, save):

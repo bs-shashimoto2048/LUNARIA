@@ -7,6 +7,7 @@ import sys
 import unittest
 import warnings
 from pathlib import Path
+from unittest import mock
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # GPU を一切使わない（torch の import 前に設定）
 warnings.simplefilter("ignore")
@@ -183,6 +184,100 @@ class ParamSummaryTests(unittest.TestCase):
         q = s["by_kind"]["int8(AffineQuantizedTensor)"]
         self.assertEqual(q["count"], 2)
         self.assertEqual(q["bytes"], 2 * 128 * 128)  # int8 は 1 バイト/要素
+
+
+class D0HelperTests(unittest.TestCase):
+    """D0（合成 GPU 診断）の補助関数。GPU は使わない（CUDA は隠してある）。"""
+
+    def test_budget_keeps_the_3gb_floor_for_ram_and_commit(self):
+        with mock.patch.object(dp, "avail_gb", return_value=7.0), mock.patch.object(dp, "commit_headroom_gb",
+                                                                                      return_value=18.0):
+            ok, b = dp.d0_budget(0.3, 3.0)
+            self.assertTrue(ok)
+            self.assertEqual(b["floor_gb"], 3.0)
+        with mock.patch.object(dp, "avail_gb", return_value=3.2), mock.patch.object(dp, "commit_headroom_gb",
+                                                                                      return_value=18.0):
+            self.assertFalse(dp.d0_budget(0.3, 3.0)[0])        # 空き RAM 3.2 − 0.3 = 2.9 < 3.0
+        with mock.patch.object(dp, "avail_gb", return_value=9.0), mock.patch.object(dp, "commit_headroom_gb",
+                                                                                      return_value=5.5):
+            self.assertFalse(dp.d0_budget(0.3, 3.0)[0])        # commit 余裕 5.5 − 3.0 = 2.5 < 3.0
+        with mock.patch.object(dp, "avail_gb", return_value=3.3), mock.patch.object(dp, "commit_headroom_gb",
+                                                                                      return_value=6.0):
+            self.assertTrue(dp.d0_budget(0.3, 3.0)[0])         # ちょうど 3.0 は許可（境界）
+
+    def test_deltas_are_relative_to_pre(self):
+        rec = {"pre": {"private_mb": 1000, "commit_headroom_gb": 18.0, "avail_gb": 7.0, "vram_used_mb": 2000},
+               "post": {"private_mb": 1300, "commit_headroom_gb": 17.5, "avail_gb": 6.9, "vram_used_mb": 2500},
+               "released": {"private_mb": 1010, "commit_headroom_gb": 17.98, "vram_used_mb": 2010},
+               "window": {"max_private_mb": 1900, "min_commit_headroom_gb": 16.2, "max_vram_used_mb": 2600}}
+        d = dp.d0_deltas(rec)
+        self.assertEqual(d["private_post_mb"], 300)
+        self.assertEqual(d["private_window_max_mb"], 900)
+        self.assertAlmostEqual(d["commit_post_gb"], 0.5)
+        self.assertAlmostEqual(d["commit_window_max_gb"], 1.8)
+        self.assertEqual(d["vram_post_mb"], 500)
+        self.assertEqual(d["vram_window_max_mb"], 600)
+        self.assertEqual(d["private_released_mb"], 10)
+        self.assertAlmostEqual(d["commit_released_gb"], 0.02)
+        self.assertAlmostEqual(d["avail_post_drop_gb"], 0.1)
+
+    def test_stage_records_phases_and_release(self):
+        mon = dp.SelfMonitor(avail_fn=lambda: 8.0, commit_fn=lambda: 18.0, private_fn=lambda: 100 * dp.MB,
+                             rss_fn=lambda: 10 * dp.MB, interval=0.1)
+        released = []
+        with mock.patch.object(dp.time, "sleep", lambda s: mon.tick()):  # sleep のたびにサンプルを 1 つ取る
+            rec = dp.d0_stage("t_stage", mon, lambda: {"ok": 1}, lambda: released.append(1), settle_s=0.4)
+        for k in ("pre", "post", "released", "window", "seconds", "deltas"):
+            self.assertIn(k, rec)
+        self.assertEqual(rec["result"], {"ok": 1})
+        self.assertIsNone(rec["error"])
+        self.assertEqual(released, [1])
+        self.assertGreater(rec["window"]["samples"], 0)
+
+    def test_stage_error_is_recorded_not_raised(self):
+        mon = dp.SelfMonitor(avail_fn=lambda: 8.0, commit_fn=lambda: 18.0, private_fn=lambda: 1, rss_fn=lambda: 1)
+
+        def boom():
+            raise RuntimeError("CUDA error: out of memory")
+
+        with mock.patch.object(dp.time, "sleep", lambda s: None):
+            rec = dp.d0_stage("t_err", mon, boom, None, settle_s=0.0)
+        self.assertIn("CUDA error", rec["error"])
+        self.assertIsNone(rec["result"])        # エラーは結果を持たない = 成功扱いにならない
+
+    def test_window_resets_per_stage(self):
+        mon = dp.SelfMonitor(avail_fn=lambda: 8.0, commit_fn=lambda: 12.0, private_fn=lambda: 500 * dp.MB,
+                             rss_fn=lambda: 1, interval=0.1)
+        mon.tick()
+        self.assertEqual(mon.window_summary()["min_commit_headroom_gb"], 12.0)
+        mon.reset_window()
+        self.assertEqual(mon.window_summary()["samples"], 0)
+        self.assertIsNone(mon.window_summary()["min_commit_headroom_gb"])
+
+
+class SysMonitorTests(unittest.TestCase):
+    def test_streams_samples_and_tracks_minimums(self):
+        import tempfile
+        import dit_diag as dd
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sys.jsonl"
+            vals = iter([(8.0, 70, 18.0), (7.5, 71, 16.0), (7.9, 70, 17.5)])
+            m = dd.SysMonitor(path, status_fn=lambda: next(vals))
+            with open(path, "a", encoding="utf-8") as f:
+                for _ in range(3):
+                    m.tick(f)
+            rows = [__import__("json").loads(x) for x in path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 3)
+            s = m.summary()
+            self.assertEqual(s["min_avail_gb"], 7.5)
+            self.assertEqual(s["min_commit_headroom_gb"], 16.0)
+
+    def test_real_status_is_cheap(self):
+        import dit_diag as dd
+        m = dd.SysMonitor(Path(os.devnull))
+        for _ in range(300):
+            m.tick(None)
+        self.assertLess(m.summary()["tick_cost_mean_ms"], 1.0)  # GlobalMemoryStatusEx のみ。0.1 秒周期に対して無視できる
 
 
 class DiagOptionTests(unittest.TestCase):
