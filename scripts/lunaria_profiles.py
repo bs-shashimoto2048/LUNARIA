@@ -32,11 +32,85 @@ VRAM_MARGIN_MIB = 512
 # これは「その段階の確保前に安全に失敗させる」ための保護で、preflight の閾値（上の b_prime_admission）とは別物。
 # preflight の閾値は、初期化時の RAM 消費の改善が実機で確認されるまで引き下げない。
 STAGE_NEED_GB = {
-    "dit_gpu_direct": 0.6,   # GPU 直接ロードでは CPU 側はパラメータ 1 つ分の一時領域のみ（最大テンソル未測定のため余裕を見る）
+    # 当初は 0.6（パラメータ 1 つ分の一時領域の見込み）。DiT 診断（run 20261022-164908）の観測で、クラッシュ前までに
+    # 物理 RAM が約 0.86GB 低下したため 1.0 に引き上げた（観測値は途中までのため、実際はさらに大きい可能性がある）
+    "dit_gpu_direct": 1.0,
     "text_encoder": 1.6,     # Qwen3-Embedding-0.6B bf16 1.12GB × 1.14 ≒ 1.28GB + 余裕
     "lm": 1.8,               # acestep-5Hz-lm-0.6B bf16 1.28GB × 1.14 ≒ 1.46GB + 余裕
 }
 STAGE_GUARD_FLOOR_GB = HARD_ABORT_FLOOR_GB  # 段階の確保後も、空き RAM をこの値以上残す
+
+
+# --- DiT 単独の段階的 GPU 診断の許可条件（docs/PHASE0_DIT_DIAGNOSTIC.md）-------------------------
+# 条件: 実行開始前の空き RAM >= 見込み消費量 + 安全余裕 3GB（安全下限は引き下げない）。
+# 見込み消費量は「実測済みの成分は実測値、未測定の成分は上限見積り」で積む（推定だけで許可しない）。
+IMPORT_FULL_PRIVATE_GB = 2.553   # E1 実測: torch + transformers + diffusers + acestep.api_server の import（private）
+CUDA_HOST_UPPER_GB = 1.0         # CUDA コンテキストのホスト側 private の上限見積り（未測定。B2 の実測値で置換する）
+DIT_FILE_VRAM_MIB = 4570         # DiT bf16 の重み 4.46GiB（実測のファイルサイズ）
+CUDA_CTX_VRAM_UPPER_MIB = 1024   # CUDA コンテキストの VRAM 上限見積り（未測定。B2 の実測値で置換する）
+SAFETY_FLOOR_GB = HARD_ABORT_FLOOR_GB  # 3.0
+# DiT 診断（run 20261022-164908、未量子化 DiT の GPU 直接ロードで torch_cpu.dll がアクセス違反）の観測:
+#   VRAM の先確保（caching_allocator_warmup）と同時にプロセスの commit が CUDA コンテキスト後の 6.5GB から 20.3GB へ約 2 秒間急増し、
+#   その後 11.2GB（+4.7GB。VRAM 4.5GB 分に相当）へ落ちた。開始前のシステム commit 余裕は 16.3GB で、
+#   急増分（+13.8GB）が余裕を超えていた（commit 上限超過が有力な原因）。物理 RAM は最後まで 4.3GB 以上を維持。
+DIT_COMMIT_PEAK_OBSERVED_GB = 13.8
+
+
+def dit_diag_admission(step, measured=None, avail_gb=None, commit_headroom_gb=None, free_vram_mib=None):
+    """DiT 単独診断の各ステップ（b1 / b2 / cd）を実行してよいかを判定する。
+
+    step: "b1" = import のみ / "b2" = import（handler のみ）+ CUDA コンテキスト / "cd" = DiT の GPU 直接ロード + INT8
+    measured: 直前ステップの実測値 {"b2_private_after_cuda_gb": float, "ctx_vram_mib": int} があれば置換に使う
+    """
+    # 空き RAM の判定には「物理消費」（available の低下量と RSS 増加の大きい方）を使う。他プロセスへの影響は物理の空きで決まるため。
+    # commit 余裕の判定には private（commit 量）を使う。private は numpy 等の予約分を含み物理消費を過大評価しうる。
+    # 実測が無い成分は、private ベースの E1 実測（2.553GB）や上限見積りを使う（保守側）。
+    measured = measured or {}
+    if step == "b1":
+        ram, commit = IMPORT_FULL_PRIVATE_GB, IMPORT_FULL_PRIVATE_GB
+        basis = "import は E1 実測（private 2.553GB。物理消費は未測定のため保守側の値を使用）"
+        vram_need = 0
+    elif step == "b2":
+        imp_ram = measured.get("b1_phys_gb", IMPORT_FULL_PRIVATE_GB)
+        ram = imp_ram + CUDA_HOST_UPPER_GB
+        commit = IMPORT_FULL_PRIVATE_GB + CUDA_HOST_UPPER_GB
+        basis = (f"import は{'B1 の物理消費の実測値' if 'b1_phys_gb' in measured else 'E1 実測（保守側）'}"
+                 f"{imp_ram:.2f}GB + CUDA ホストは未測定の上限見積り {CUDA_HOST_UPPER_GB}GB")
+        vram_need = CUDA_CTX_VRAM_UPPER_MIB + 256
+    elif step == "cd":
+        dit_upper = STAGE_NEED_GB["dit_gpu_direct"]
+        if "b2_phys_after_cuda_gb" in measured:
+            base_ram, tag = measured["b2_phys_after_cuda_gb"], "import + CUDA コンテキストは B2 の物理消費の実測値"
+        else:
+            base_ram, tag = IMPORT_FULL_PRIVATE_GB + CUDA_HOST_UPPER_GB, "import + CUDA は上限見積り（B2 未実測）"
+        base_commit = measured.get("b2_private_after_cuda_gb", IMPORT_FULL_PRIVATE_GB + CUDA_HOST_UPPER_GB)
+        # commit は観測した急増（+13.8GB）を下回らないようにする（推定の上限ではなく実際に観測した値）
+        ram, commit = base_ram + dit_upper, base_commit + max(dit_upper, DIT_COMMIT_PEAK_OBSERVED_GB)
+        basis = (f"{tag} {base_ram:.2f}GB + DiT の物理上限 {dit_upper}GB / "
+                 f"commit は観測した急増 +{DIT_COMMIT_PEAK_OBSERVED_GB}GB を使用")
+        ctx = measured.get("ctx_vram_mib", CUDA_CTX_VRAM_UPPER_MIB)
+        vram_need = DIT_FILE_VRAM_MIB + ctx + VRAM_MARGIN_MIB
+    else:
+        raise ValueError(step)
+    cons = ram
+    out = {"step": step, "consumption_gb": round(cons, 2), "commit_consumption_gb": round(commit, 2), "basis": basis,
+           "safety_floor_gb": SAFETY_FLOOR_GB,
+           "required_free_ram_gb": round(cons + SAFETY_FLOOR_GB, 2),
+           "required_commit_headroom_gb": round(commit + MIN_COMMIT_MARGIN_GB, 2),
+           "required_free_vram_mib": int(vram_need)}
+    if avail_gb is not None:
+        out["checks"] = {
+            "free_ram": {"ok": avail_gb >= out["required_free_ram_gb"],
+                         "detail": f"{avail_gb:.2f}GB >= {out['required_free_ram_gb']}GB"
+                                   f"（消費 {out['consumption_gb']} + 余裕 {SAFETY_FLOOR_GB}）"},
+            "commit_headroom": {"ok": commit_headroom_gb is not None
+                                and commit_headroom_gb >= out["required_commit_headroom_gb"],
+                                "detail": f"{commit_headroom_gb}GB >= {out['required_commit_headroom_gb']}GB"},
+            "free_vram": {"ok": free_vram_mib is not None and free_vram_mib >= vram_need,
+                          "detail": f"{free_vram_mib}MiB >= {int(vram_need)}MiB"},
+        }
+        out["ok"] = all(c["ok"] for c in out["checks"].values())
+    return out
 
 
 def b_prime_admission():

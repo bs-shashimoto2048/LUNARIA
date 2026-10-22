@@ -50,6 +50,7 @@ MIN_COMMIT_HEADROOM_GB = 8.0
 MIN_FREE_VRAM_MIB = 3500
 ABORT_FREE_RAM_GB = 1.5    # 実行中にこれを下回ったら自エンジンを正常停止して中断
 ABORT_CONSECUTIVE = 3
+ABORT_COMMIT_HEADROOM_GB = 3.0  # commit 余裕がこれを下回ったら所有プロセスのみ停止（commit 上限超過はネイティブクラッシュの原因になる）
 
 sys.path.insert(0, str(ROOT / "scripts"))
 from validate_wav import validate  # noqa: E402
@@ -317,6 +318,8 @@ class Monitor(threading.Thread):
         self.min_free_ram = 1e9
         self.pressure = False
         self._low = 0
+        self._clow = 0
+        self.min_commit_headroom = 1e9
         self.lock = threading.Lock()
 
     def run(self):
@@ -338,14 +341,18 @@ class Monitor(threading.Thread):
                 except psutil.Error:
                     pass
                 snap = mem_snapshot()
+                commit_headroom = commit_info()["commit_headroom_gb"]
                 with self.lock:
                     if used:
                         self.max_vram = max(self.max_vram, used)
                     self.max_rss = max(self.max_rss, rss)
                     self.max_private = max(self.max_private, private)
                     self.min_free_ram = min(self.min_free_ram, snap["free_ram_gb"])
+                    self.min_commit_headroom = min(self.min_commit_headroom, commit_headroom)
                     self._low = self._low + 1 if snap["free_ram_gb"] < ABORT_FREE_RAM_GB else 0
-                    if self._low >= ABORT_CONSECUTIVE:
+                    # commit 上限の超過は物理 RAM に余裕があっても起きる（DiT 診断で観測）。commit 余裕も監視して中断する
+                    self._clow = self._clow + 1 if commit_headroom < ABORT_COMMIT_HEADROOM_GB else 0
+                    if self._low >= ABORT_CONSECUTIVE or self._clow >= ABORT_CONSECUTIVE:
                         self.pressure = True
                 n += 1
                 if True:  # 1秒間隔で書き出し
@@ -353,7 +360,8 @@ class Monitor(threading.Thread):
                                         "phase": self.phase,
                                         "vram_mib": used,
                                         "tree_rss_mb": round(rss / 1048576),
-                                        "tree_private_mb": round(private / 1048576), **snap}) + "\n")
+                                        "tree_private_mb": round(private / 1048576),
+                                        "commit_headroom_gb": commit_headroom, **snap}) + "\n")
                     f.flush()
                 time.sleep(1)
 
@@ -361,9 +369,11 @@ class Monitor(threading.Thread):
         with self.lock:
             r = {"max_vram_mib": self.max_vram, "max_rss_mb": round(self.max_rss / 1048576),
                  "max_private_mb": round(self.max_private / 1048576),
-                 "min_free_ram_gb": None if self.min_free_ram == 1e9 else self.min_free_ram}
+                 "min_free_ram_gb": None if self.min_free_ram == 1e9 else self.min_free_ram,
+                 "min_commit_headroom_gb": None if self.min_commit_headroom == 1e9 else self.min_commit_headroom}
             self.max_vram = self.max_rss = self.max_private = 0
             self.min_free_ram = 1e9
+            self.min_commit_headroom = 1e9
         return r
 
 

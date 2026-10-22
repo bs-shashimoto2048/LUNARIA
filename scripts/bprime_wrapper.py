@@ -289,18 +289,21 @@ def ram_guard(stage, avail_fn=None):
 
 
 def apply_low_peak_patches(automodel_cls=None, handler_cls=None, llm_cls=None, llm_module=None,
-                           cuda_available=None, avail_fn=None):
+                           cuda_available=None, avail_fn=None, components=("dit", "te", "lm"),
+                           disable_warmup=False, warmup_module=None):
     """DiT を GPU 直接ロード、LM / Text Encoder を bf16 で直接ロードするよう、呼び出しを実行時に差し替える。
 
     各段階の直前に RAM ガードを置く。引数はテスト用の差し替え口（通常は全て None = 本物の上流クラス）。
+    components で対象を絞れる（DiT 単独診断では ("dit",)。不要なモジュールを import せず RAM を節約する）。
     """
     import torch
+    want_te, want_lm = "te" in components, "lm" in components
     if automodel_cls is None:
         import transformers
         automodel_cls = transformers.AutoModel
-    if handler_cls is None:
+    if want_te and handler_cls is None:
         from acestep.handler import AceStepHandler as handler_cls
-    if llm_cls is None or llm_module is None:
+    if want_lm and (llm_cls is None or llm_module is None):
         import acestep.llm_inference as _llm_mod
         llm_module = llm_module or _llm_mod
         llm_cls = llm_cls or _llm_mod.LLMHandler
@@ -329,9 +332,24 @@ def apply_low_peak_patches(automodel_cls=None, handler_cls=None, llm_cls=None, l
         automodel_cls.from_pretrained = staticmethod(patched_fp)
         LOWPEAK_APPLIED.append("AutoModel.from_pretrained (DiT: device_map, Text Encoder: dtype=bf16)")
 
+    # 1b) （オプション・既定オフ）transformers の caching_allocator_warmup を無効化する。device_map で GPU へ直接ロードすると、
+    #     これがモデル全体分の VRAM を先に確保する。DiT 診断では、その確保と同時にプロセスの commit が約 13.8GB 急増した
+    #     （VRAM 割り当てが commit に計上される Windows の挙動が有力）。無効化すると VRAM は読み込みに合わせて段階的に確保される。
+    #     効果は未検証のため、明示的に指定した場合のみ適用する。
+    if disable_warmup:
+        wm = warmup_module
+        if wm is None:
+            import transformers.modeling_utils as wm
+        if not getattr(wm.caching_allocator_warmup, "_lunaria_noop", False):
+            def _noop_warmup(*args, **kwargs):
+                return None
+            _noop_warmup._lunaria_noop = True
+            wm.caching_allocator_warmup = _noop_warmup
+            LOWPEAK_APPLIED.append("caching_allocator_warmup を無効化（VRAM の先確保を止める。オプション）")
+
     # 2) Text Encoder: offload 時に CPU で fp32 へ広げない（ロード処理の間だけ _get_vae_dtype('cpu') を bf16 にする）
-    orig_te = handler_cls._load_text_encoder_and_tokenizer
-    if not getattr(orig_te, "_lunaria_lowpeak", False):
+    orig_te = handler_cls._load_text_encoder_and_tokenizer if want_te else None
+    if want_te and not getattr(orig_te, "_lunaria_lowpeak", False):
         def patched_te(self, *args, **kwargs):
             real = self._get_vae_dtype
 
@@ -349,8 +367,8 @@ def apply_low_peak_patches(automodel_cls=None, handler_cls=None, llm_cls=None, l
         LOWPEAK_APPLIED.append("_load_text_encoder_and_tokenizer (CPU 常駐を bf16 に)")
 
     # 3) LM(pt): AutoModelForCausalLM を、ロード処理の間だけ dtype を注入するプロキシへ差し替える
-    orig_lm = llm_cls._load_pytorch_model
-    if not getattr(orig_lm, "_lunaria_lowpeak", False):
+    orig_lm = llm_cls._load_pytorch_model if want_lm else None
+    if want_lm and not getattr(orig_lm, "_lunaria_lowpeak", False):
         def patched_lm(self, model_path, device):
             try:
                 ram_guard("lm", avail_fn)

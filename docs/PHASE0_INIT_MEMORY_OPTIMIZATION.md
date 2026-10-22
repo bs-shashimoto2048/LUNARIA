@@ -4,6 +4,12 @@
 
 > Phase 0 Stage A（30 秒インスト生成）は未達のまま。本書は B′ の GPU 動作や Stage A の成功を主張しない。
 
+> **訂正（DiT 診断後。詳細は `PHASE0_DIT_DIAGNOSTIC.md`）**
+> - 本書の `L = 2.55GB` は **commit 量（private）であり、物理消費ではない**。import の物理消費は約 0.7〜0.8GB（E1 の private に numpy の予約約 780MB が含まれていた）
+> - 一方、本書が見落としていた **CUDA コンテキストが物理 RAM を約 2.6GB（commit は約 4.0GB）消費する**。import + CUDA の物理ベースラインは約 3.4GB [実測]
+> - したがって §4・§7 の絶対値は置き換えが必要（8GB 環境の見通しは本書より厳しい）。主要な発見（DiT の CPU 実体化、LM・Text Encoder の fp32 展開と居座り、`device_map` / `dtype` の注入が transformers で受理されること）は変わらない
+> - **DiT の `device_map` による GPU 直接ロードは、実機で `torch_cpu.dll` のアクセス違反により失敗した**（commit の急増と同時。commit 上限の超過が有力な原因）。§5 の候補 A の「採用（実装済み）」は、実機で動作が確認できていない状態である
+
 ## 0. 方針と目標
 
 - 複数プロジェクト並行・Chrome / WSL / 遠方監視システムの稼働を前提に、**空き物理 RAM 8GB 程度**で安全に初期化できる方式を探す（6GB は追加目標）
