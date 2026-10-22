@@ -219,6 +219,165 @@ def apply_patch(handler_cls=None):
 
 
 # ---------------------------------------------------------------------------------------------
+# 初期化ピーク RAM の削減（低ピーク・ロード）。上流ソースは変更せず、実行時ラップのみ
+# ---------------------------------------------------------------------------------------------
+# 根拠（docs/PHASE0_INIT_MEMORY_OPTIMIZATION.md）:
+#   - DiT: AutoModel.from_pretrained(..., dtype=bf16) に device_map が無く、全重みが CPU 上に private コピーとして
+#     実体化される（実測: 512MB の safetensors で private +585MB）。device_map を渡すと transformers は
+#     パラメータ単位で GPU へ直接実体化する（safe_open(device=GPU)）。
+#   - LM(pt) / Text Encoder: dtype 指定なしで読むため fp32 に展開される。その後 bf16 へ変換しても、解放された
+#     fp32 の領域が OS へ返らず private が下がらない（実測: fp32 641MB → bf16 変換後も 664MB）。
+#     チェックポイントは bf16 なので、最初から bf16 で読めば数値は同一（fp32 経由は可逆な拡張・縮小のみ）。
+#   - offload_to_cpu 時の Text Encoder は CPU 上で fp32 に変換される（_get_vae_dtype("cpu") が fp32）。
+DIT_DIR = "acestep-v15-turbo"
+TE_DIR = "Qwen3-Embedding-0.6B"
+DIT_DEVICE_MAP = {"": "cuda:0"}
+LOAD_EVENTS = []          # 各ロード段階のプロセス private メモリ（診断レポートに含める）
+LOWPEAK_APPLIED = []
+
+
+def _basename(p):
+    return os.path.basename(str(p).rstrip("/\\"))
+
+
+def upstream_assumption_problems(engine_root=None):
+    """低ピーク・パッチが前提とする上流ソースの形を静的に確認する。1 つでも崩れていれば問題リストを返す。"""
+    root = Path(engine_root) if engine_root else ROOT / "engine" / "ACE-Step-1.5"
+    pkg = root / "acestep"
+    problems = []
+
+    def text(rel):
+        try:
+            return (pkg / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            problems.append(f"読み込めない: {rel}")
+            return ""
+
+    loader = text("core/generation/handler/init_service_loader.py")
+    if "AutoModel.from_pretrained(" not in loader or "device_map" in loader:
+        problems.append("DiT の from_pretrained の形が想定と異なる（device_map を既に使っている/呼び出しが無い）")
+    comp = text("core/generation/handler/init_service_loader_components.py")
+    if "AutoModel.from_pretrained(text_encoder_path)" not in comp or '_get_vae_dtype("cpu")' not in comp:
+        problems.append("Text Encoder のロード処理の形が想定と異なる")
+    mem = text("core/generation/handler/memory_utils.py")
+    if not __import__("re").search(r'target_device == "cpu":\s*\n\s*return torch\.float32', mem):
+        problems.append("_get_vae_dtype('cpu') が float32 を返す前提が崩れている")
+    llm = text("llm_inference.py")
+    if "AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)" not in llm \
+            or "from transformers import AutoTokenizer, AutoModelForCausalLM" not in llm:
+        problems.append("LM(pt) のロード処理の形が想定と異なる")
+    return problems
+
+
+def available_ram_gb():
+    import psutil
+    return psutil.virtual_memory().available / 1024**3
+
+
+def ram_guard(stage, avail_fn=None):
+    """段階の確保前に、空き RAM が（必要量 + 下限）以上あるかを確認する。足りなければ MemoryError。
+
+    確保前に失敗させるので、システム全体を逼迫させない。preflight の閾値とは別の追加保護。
+    """
+    avail = (avail_fn or available_ram_gb)()
+    need = lp.STAGE_NEED_GB[stage]
+    floor = lp.STAGE_GUARD_FLOOR_GB
+    if avail - need < floor - 1e-9:  # 境界値の浮動小数点誤差で誤って拒否しない
+        raise MemoryError(f"RAM ガード: 段階 {stage!r} の確保前に空き RAM {avail:.2f}GB。"
+                          f"必要 {need}GB + 下限 {floor}GB を満たさないため中止（確保していない）")
+    return avail
+
+
+def apply_low_peak_patches(automodel_cls=None, handler_cls=None, llm_cls=None, llm_module=None,
+                           cuda_available=None, avail_fn=None):
+    """DiT を GPU 直接ロード、LM / Text Encoder を bf16 で直接ロードするよう、呼び出しを実行時に差し替える。
+
+    各段階の直前に RAM ガードを置く。引数はテスト用の差し替え口（通常は全て None = 本物の上流クラス）。
+    """
+    import torch
+    if automodel_cls is None:
+        import transformers
+        automodel_cls = transformers.AutoModel
+    if handler_cls is None:
+        from acestep.handler import AceStepHandler as handler_cls
+    if llm_cls is None or llm_module is None:
+        import acestep.llm_inference as _llm_mod
+        llm_module = llm_module or _llm_mod
+        llm_cls = llm_cls or _llm_mod.LLMHandler
+    cuda_ok = cuda_available or torch.cuda.is_available
+
+    # 1) AutoModel.from_pretrained: DiT は device_map で GPU 直接、Text Encoder は bf16 で直接
+    orig_fp = automodel_cls.from_pretrained
+    if not getattr(orig_fp, "_lunaria_lowpeak", False):
+        def patched_fp(pretrained_model_name_or_path, *args, **kwargs):
+            name = _basename(pretrained_model_name_or_path)
+            injected = {}
+            avail = None
+            if name == DIT_DIR and "device_map" not in kwargs and cuda_ok():
+                avail = ram_guard("dit_gpu_direct", avail_fn)
+                kwargs["device_map"] = dict(DIT_DEVICE_MAP)
+                injected["device_map"] = DIT_DEVICE_MAP[""]
+            elif name == TE_DIR and "dtype" not in kwargs and "torch_dtype" not in kwargs:
+                avail = ram_guard("text_encoder", avail_fn)
+                kwargs["dtype"] = torch.bfloat16
+                injected["dtype"] = "bfloat16"
+            out = orig_fp(pretrained_model_name_or_path, *args, **kwargs)
+            LOAD_EVENTS.append({"stage": f"AutoModel.from_pretrained:{name}", "injected": injected,
+                                "avail_gb_before": None if avail is None else round(avail, 2), **proc_mem()})
+            return out
+        patched_fp._lunaria_lowpeak = True
+        automodel_cls.from_pretrained = staticmethod(patched_fp)
+        LOWPEAK_APPLIED.append("AutoModel.from_pretrained (DiT: device_map, Text Encoder: dtype=bf16)")
+
+    # 2) Text Encoder: offload 時に CPU で fp32 へ広げない（ロード処理の間だけ _get_vae_dtype('cpu') を bf16 にする）
+    orig_te = handler_cls._load_text_encoder_and_tokenizer
+    if not getattr(orig_te, "_lunaria_lowpeak", False):
+        def patched_te(self, *args, **kwargs):
+            real = self._get_vae_dtype
+
+            def cpu_bf16(device=None, _real=real, _self=self):
+                return torch.bfloat16 if (device or _self.device) == "cpu" else _real(device)
+
+            self._get_vae_dtype = cpu_bf16
+            try:
+                return orig_te(self, *args, **kwargs)
+            finally:
+                self.__dict__.pop("_get_vae_dtype", None)  # インスタンス属性を外して本来のメソッドへ戻す
+                LOAD_EVENTS.append({"stage": "text_encoder_loaded", **proc_mem()})
+        patched_te._lunaria_lowpeak = True
+        handler_cls._load_text_encoder_and_tokenizer = patched_te
+        LOWPEAK_APPLIED.append("_load_text_encoder_and_tokenizer (CPU 常駐を bf16 に)")
+
+    # 3) LM(pt): AutoModelForCausalLM を、ロード処理の間だけ dtype を注入するプロキシへ差し替える
+    orig_lm = llm_cls._load_pytorch_model
+    if not getattr(orig_lm, "_lunaria_lowpeak", False):
+        def patched_lm(self, model_path, device):
+            try:
+                ram_guard("lm", avail_fn)
+            except MemoryError as e:  # 上流の戻り値規約（成功フラグ, メッセージ）に合わせる。LM 未初期化は診断で失敗扱い
+                return False, str(e)
+            real = llm_module.AutoModelForCausalLM
+            want = getattr(self, "dtype", None)
+
+            class _Proxy:
+                @staticmethod
+                def from_pretrained(*a, **kw):
+                    if want is not None and "dtype" not in kw and "torch_dtype" not in kw:
+                        kw["dtype"] = want
+                    return real.from_pretrained(*a, **kw)
+
+            llm_module.AutoModelForCausalLM = _Proxy
+            try:
+                return orig_lm(self, model_path, device)
+            finally:
+                llm_module.AutoModelForCausalLM = real
+                LOAD_EVENTS.append({"stage": "lm_loaded", "dtype": str(want), **proc_mem()})
+        patched_lm._lunaria_lowpeak = True
+        llm_cls._load_pytorch_model = patched_lm
+        LOWPEAK_APPLIED.append("LLMHandler._load_pytorch_model (dtype=LM の dtype で直接ロード)")
+
+
+# ---------------------------------------------------------------------------------------------
 # 診断（モデル初期化と量子化まで。音楽生成はしない）
 # ---------------------------------------------------------------------------------------------
 def _probe_context(label, ctx_factory):
@@ -284,11 +443,14 @@ def diag_thread(app, server, report_path, timeout_s):
         report["startup_seconds"] = round(time.time() - t0, 1)
         report["server_started"] = bool(getattr(server, "started", False))
         report["verify_int8"] = VERIFY_RESULTS[-1] if VERIFY_RESULTS else None
+        report["lowpeak_patches_applied"] = list(LOWPEAK_APPLIED)
+        report["load_events"] = list(LOAD_EVENTS)  # 段階ごとの private メモリ（A の初期化との比較用）
         report["llm_initialized"] = bool(getattr(app.state, "_llm_initialized", False))
         report["llm_init_error"] = getattr(app.state, "_llm_init_error", None)
         if report["server_started"] and VERIFY_RESULTS and VERIFY_RESULTS[-1].get("ok"):
             report.update(run_probes(app))
-            report["status"] = "ok"
+            # B′ は LM 0.6B が前提。RAM ガード等で LM が未初期化のまま起動した場合は成功扱いにしない
+            report["status"] = "ok" if report["llm_initialized"] else "llm_not_initialized"
         else:
             report["status"] = "failed_before_probes"
     except Exception as e:
@@ -309,7 +471,11 @@ def main():
     args = ap.parse_args()
 
     assert_profile_env()
+    problems = upstream_assumption_problems()
+    if problems:  # 上流の形が想定と違うなら、盲目的にパッチせず失敗させる
+        raise RuntimeError("上流 ACE-Step の前提が崩れている: " + "; ".join(problems))
     apply_patch()
+    apply_low_peak_patches()
 
     import uvicorn
     import acestep.api_server as srv
@@ -327,6 +493,8 @@ def main():
     if args.diagnose_init and not Path(args.report).exists():
         atomic_write(args.report, {"mode": "diagnose-init", "status": "failed_startup", "exit_code": code,
                                    "generation": "NOT RUN",
+                                   "lowpeak_patches_applied": list(LOWPEAK_APPLIED),
+                                   "load_events": list(LOAD_EVENTS),
                                    "verify_int8": VERIFY_RESULTS[-1] if VERIFY_RESULTS else None})
     sys.exit(code)
 

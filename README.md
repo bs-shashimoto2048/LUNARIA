@@ -33,6 +33,7 @@ Windows 11 / RTX 4070 Laptop GPU（8GB）/ Python 3.11.17（uv）/ PyTorch 2.7.1
 構築・再現手順: `docs/PHASE0_SETUP.md`。移行記録: `docs/PHASE0_MIGRATION.md`。実測結果: `docs/PHASE0_GPU_BASELINE.md`。
 低メモリ運用の設計と ACE-Step のメモリ管理の監査: `docs/PHASE0_LOW_MEMORY_DESIGN.md`。
 プロファイル B′（INT8 + DiT GPU 常駐）の実装と診断準備: `docs/PHASE0_BPRIME_PROFILE.md`。
+B′ の初期化ピーク RAM の削減（実ソース解析・実測・候補比較）: `docs/PHASE0_INIT_MEMORY_OPTIMIZATION.md`。
 互換性・ライセンス（`PHASE0_COMPATIBILITY.md`）は未作成。ACE-Step 本体は MIT、モデルカードも MIT。
 
 ## 取得とセットアップ（概要）

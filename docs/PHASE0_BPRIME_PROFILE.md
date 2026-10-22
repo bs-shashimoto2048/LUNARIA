@@ -36,7 +36,15 @@ VAE 用の余裕を削る可能性がある**。B′ の目的（VAE を GPU で
 | `scripts/lunaria_profiles.py` | プロファイル A / B′ / C の環境変数定義、B′ の実行許可条件（実測値が根拠） |
 | `scripts/bprime_wrapper.py` | 起動ラッパー。`AceStepHandler.initialize_service` を実行時に差し替え、INT8 を適用して検証 |
 | `scripts/bprime_diag.py` | 診断ランナー。事前確認・所有プロセス管理・テレメトリ・停止検証 |
-| `scripts/test_bprime_wrapper.py` | 単体テスト 14 件（GPU・モデル不使用） |
+| `scripts/test_bprime_wrapper.py` | 単体テスト 38 件（GPU・実モデル不使用。極小モデルによる実 transformers の確認を含む） |
+| `scripts/measure_load_memory.py` | ロード経路のメモリ挙動の CPU・合成データ実測（E1〜E4） |
+
+### 初期化ピーク RAM の削減（低ピーク・ロード）
+
+B′ の初期化では、DiT が CPU 上に実体化され、LM と Text Encoder が fp32 に展開されるため、初期化時の RAM ピークが大きい。
+ラッパーは、DiT の GPU 直接ロード、LM と Text Encoder の bf16 直接ロード、段階ごとの RAM ガードを実行時に適用する。
+調査結果・実測・候補の比較・8GB での実行可能性の評価は **`PHASE0_INIT_MEMORY_OPTIMIZATION.md`** に記載。
+効果は推定（ピーク −1.7〜2.4GB）で、実機での確認は未実施。preflight の閾値は引き下げていない。
 
 ### モデル初期化と量子化の順序（明示）
 

@@ -140,6 +140,53 @@ def main():
         find("api/startup_model_init.py", r'env_bool\("ACESTEP_NO_INIT", True\)') is not None, "startup_model_init.py")
     add("アイドル時の自動解放（idle unload）機構は存在しない", tree_has(r"idle_unload|ACESTEP_IDLE") is None, "")
 
+    # ---- 初期化ピーク RAM の経路（docs/PHASE0_INIT_MEMORY_OPTIMIZATION.md の根拠）----
+    loader = "core/generation/handler/init_service_loader.py"
+    comp = "core/generation/handler/init_service_loader_components.py"
+    orch = "core/generation/handler/init_service_orchestrator.py"
+    add("[初期化] DiT の from_pretrained に device_map が無い（全重みが CPU 上に実体化される）",
+        find(loader, r"AutoModel\.from_pretrained\(") is not None and "device_map" not in read(loader),
+        f"{loader}:{find(loader, r'AutoModel.from_pretrained')}")
+    ln_to = find(loader, r"self\.model = self\.model\.to\(device\)\.to\(self\.dtype\)")
+    ln_q = find(loader, r"self\._apply_dit_quantization\(quantization\)")
+    add("[初期化] INT8 は DiT を GPU へ移した後に適用される（CPU 上では量子化しない）",
+        ln_to is not None and ln_q is not None and ln_to < ln_q, f"{loader}:{ln_to} -> :{ln_q}")
+    o_dit = find(orch, r"self\._load_main_model_from_checkpoint\(")
+    o_vae = find(orch, r"self\._load_vae_model\(")
+    o_te = find(orch, r"self\._load_text_encoder_and_tokenizer\(")
+    add("[初期化] ロード順序: DiT → VAE → Text Encoder",
+        None not in (o_dit, o_vae, o_te) and o_dit < o_vae < o_te, f"{orch}:{o_dit},{o_vae},{o_te}")
+    add("[初期化] Text Encoder は dtype 指定なしで読み込む（bf16 保存でも fp32 に展開）",
+        "AutoModel.from_pretrained(text_encoder_path)" in read(comp), f"{comp}:{find(comp, 'AutoModel.from_pretrained')}")
+    add("[初期化] offload 時、VAE / Text Encoder は CPU で _get_vae_dtype('cpu') = float32 へ変換される",
+        '_get_vae_dtype("cpu")' in read(comp)
+        and re.search(r'target_device == "cpu":\s*\n\s*return torch\.float32',
+                      read("core/generation/handler/memory_utils.py")) is not None, "")
+    add("[初期化] LM(pt) は dtype 指定なしで読み込み、その後 .to('cpu').to(dtype) で変換する",
+        "AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)" in read("llm_inference.py")
+        and 'self.llm = self.llm.to("cpu").to(self.dtype)' in read("llm_inference.py"),
+        f"llm_inference.py:{find('llm_inference.py', 'AutoModelForCausalLM.from_pretrained')}")
+    o_llm = find("api/startup_model_init.py", r"initialize_llm_at_startup\(")
+    o_svc = find("api/startup_model_init.py", r"handler\.initialize_service\(")
+    add("[初期化] LM は DiT / VAE / Text Encoder の初期化後に初期化される",
+        None not in (o_llm, o_svc) and o_svc < o_llm, f"startup_model_init.py:{o_svc} -> :{o_llm}")
+    add("[初期化] DiT のロード処理内で _release_system_memory が呼ばれない",
+        "_release_system_memory" not in read(loader), loader)
+
+    # transformers（固定版）のロード実装（site-packages を読むだけ）
+    mu = ROOT / ".venv-engine" / "Lib" / "site-packages" / "transformers" / "modeling_utils.py"
+    mu_text = mu.read_text(encoding="utf-8", errors="replace") if mu.exists() else ""
+    add("[transformers] safetensors は safe_open(device=tensor_device) + get_slice で 1 パラメータずつ実体化",
+        'safe_open(shard_file, framework="pt", device=tensor_device)' in mu_text and "file_pointer.get_slice(" in mu_text,
+        "transformers/modeling_utils.py::_load_state_dict_into_meta_model")
+    add("[transformers] device_map の int / str / torch.device は {'': device} に正規化され、dict は _no_split_modules なしで受理",
+        "device_map = {\"\": device_map}" in mu_text and "elif device_map is not None:" in mu_text
+        and "check_tied_parameters_on_same_device" in mu_text, "transformers/modeling_utils.py::from_pretrained / _get_device_map")
+    add("[transformers] device_map が None なら param_device='cpu'（CPU 上に実体化して保持）",
+        'if device_map is None:\n                param_device = "cpu"' in mu_text, "transformers/modeling_utils.py")
+    add("[transformers] low_cpu_mem_usage は無視される（常に meta 初期化）",
+        'kwargs.pop("low_cpu_mem_usage", None)' in mu_text, "transformers/modeling_utils.py")
+
     ok_all = all(c["ok"] for c in checks)
     for c in checks:
         print(f"[{'OK' if c['ok'] else 'NG'}] {c['item']}  ({c['detail']})")

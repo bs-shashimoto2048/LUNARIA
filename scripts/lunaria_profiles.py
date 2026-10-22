@@ -27,6 +27,18 @@ MIN_COMMIT_MARGIN_GB = 4.0
 VRAM_MARGIN_MIB = 512
 
 
+# --- 段階ごとの RAM ガード（低ピーク・ロード中に、各段階の確保前に空き RAM を確認する）----------
+# 必要量 = bf16 チェックポイントのサイズ × 1.14（実測: 512MB の safetensors 実体化で private +585MB）+ 余裕。
+# これは「その段階の確保前に安全に失敗させる」ための保護で、preflight の閾値（上の b_prime_admission）とは別物。
+# preflight の閾値は、初期化時の RAM 消費の改善が実機で確認されるまで引き下げない。
+STAGE_NEED_GB = {
+    "dit_gpu_direct": 0.6,   # GPU 直接ロードでは CPU 側はパラメータ 1 つ分の一時領域のみ（最大テンソル未測定のため余裕を見る）
+    "text_encoder": 1.6,     # Qwen3-Embedding-0.6B bf16 1.12GB × 1.14 ≒ 1.28GB + 余裕
+    "lm": 1.8,               # acestep-5Hz-lm-0.6B bf16 1.28GB × 1.14 ≒ 1.46GB + 余裕
+}
+STAGE_GUARD_FLOOR_GB = HARD_ABORT_FLOOR_GB  # 段階の確保後も、空き RAM をこの値以上残す
+
+
 def b_prime_admission():
     """B′ の初期化診断（測定モード）に必要な空き資源。根拠は A の初期化時の実測。"""
     peak = MEASURED_A_INIT_PEAK_RSS_GB
