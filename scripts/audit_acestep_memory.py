@@ -140,6 +140,87 @@ def main():
         find("api/startup_model_init.py", r'env_bool\("ACESTEP_NO_INIT", True\)') is not None, "startup_model_init.py")
     add("アイドル時の自動解放（idle unload）機構は存在しない", tree_has(r"idle_unload|ACESTEP_IDLE") is None, "")
 
+    # ---- 初期化ピーク RAM の経路（docs/PHASE0_INIT_MEMORY_OPTIMIZATION.md の根拠）----
+    loader = "core/generation/handler/init_service_loader.py"
+    comp = "core/generation/handler/init_service_loader_components.py"
+    orch = "core/generation/handler/init_service_orchestrator.py"
+    add("[初期化] DiT の from_pretrained に device_map が無い（全重みが CPU 上に実体化される）",
+        find(loader, r"AutoModel\.from_pretrained\(") is not None and "device_map" not in read(loader),
+        f"{loader}:{find(loader, r'AutoModel.from_pretrained')}")
+    ln_to = find(loader, r"self\.model = self\.model\.to\(device\)\.to\(self\.dtype\)")
+    ln_q = find(loader, r"self\._apply_dit_quantization\(quantization\)")
+    add("[初期化] INT8 は DiT を GPU へ移した後に適用される（CPU 上では量子化しない）",
+        ln_to is not None and ln_q is not None and ln_to < ln_q, f"{loader}:{ln_to} -> :{ln_q}")
+    o_dit = find(orch, r"self\._load_main_model_from_checkpoint\(")
+    o_vae = find(orch, r"self\._load_vae_model\(")
+    o_te = find(orch, r"self\._load_text_encoder_and_tokenizer\(")
+    add("[初期化] ロード順序: DiT → VAE → Text Encoder",
+        None not in (o_dit, o_vae, o_te) and o_dit < o_vae < o_te, f"{orch}:{o_dit},{o_vae},{o_te}")
+    add("[初期化] Text Encoder は dtype 指定なしで読み込む（bf16 保存でも fp32 に展開）",
+        "AutoModel.from_pretrained(text_encoder_path)" in read(comp), f"{comp}:{find(comp, 'AutoModel.from_pretrained')}")
+    add("[初期化] offload 時、VAE / Text Encoder は CPU で _get_vae_dtype('cpu') = float32 へ変換される",
+        '_get_vae_dtype("cpu")' in read(comp)
+        and re.search(r'target_device == "cpu":\s*\n\s*return torch\.float32',
+                      read("core/generation/handler/memory_utils.py")) is not None, "")
+    add("[初期化] LM(pt) は dtype 指定なしで読み込み、その後 .to('cpu').to(dtype) で変換する",
+        "AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)" in read("llm_inference.py")
+        and 'self.llm = self.llm.to("cpu").to(self.dtype)' in read("llm_inference.py"),
+        f"llm_inference.py:{find('llm_inference.py', 'AutoModelForCausalLM.from_pretrained')}")
+    o_llm = find("api/startup_model_init.py", r"initialize_llm_at_startup\(")
+    o_svc = find("api/startup_model_init.py", r"handler\.initialize_service\(")
+    add("[初期化] LM は DiT / VAE / Text Encoder の初期化後に初期化される",
+        None not in (o_llm, o_svc) and o_svc < o_llm, f"startup_model_init.py:{o_svc} -> :{o_llm}")
+    add("[初期化] DiT のロード処理内で _release_system_memory が呼ばれない",
+        "_release_system_memory" not in read(loader), loader)
+
+    # transformers（固定版）のロード実装（site-packages を読むだけ）
+    mu = ROOT / ".venv-engine" / "Lib" / "site-packages" / "transformers" / "modeling_utils.py"
+    mu_text = mu.read_text(encoding="utf-8", errors="replace") if mu.exists() else ""
+    add("[transformers] safetensors は safe_open(device=tensor_device) + get_slice で 1 パラメータずつ実体化",
+        'safe_open(shard_file, framework="pt", device=tensor_device)' in mu_text and "file_pointer.get_slice(" in mu_text,
+        "transformers/modeling_utils.py::_load_state_dict_into_meta_model")
+    add("[transformers] device_map の int / str / torch.device は {'': device} に正規化され、dict は _no_split_modules なしで受理",
+        "device_map = {\"\": device_map}" in mu_text and "elif device_map is not None:" in mu_text
+        and "check_tied_parameters_on_same_device" in mu_text, "transformers/modeling_utils.py::from_pretrained / _get_device_map")
+    add("[transformers] device_map が None なら param_device='cpu'（CPU 上に実体化して保持）",
+        'if device_map is None:\n                param_device = "cpu"' in mu_text, "transformers/modeling_utils.py")
+    add("[transformers] low_cpu_mem_usage は無視される（常に meta 初期化）",
+        'kwargs.pop("low_cpu_mem_usage", None)' in mu_text, "transformers/modeling_utils.py")
+
+    # ---- caching_allocator_warmup と safe_open（commit 急増・アクセス違反の調査の根拠）----
+    def line_of(text, needle):
+        for i, ln in enumerate(text.splitlines(), 1):
+            if needle in ln:
+                return i
+        return None
+
+    l_warm_call = line_of(mu_text, "caching_allocator_warmup(model, expanded_device_map, hf_quantizer)")
+    l_warm_cond = line_of(mu_text, "if device_map is not None and not is_hqq_or_quark:")
+    add("[warmup] device_map が指定されたときだけ、重みの読み込み前に呼ばれる（モジュール変数として参照される = 差し替え可能）",
+        l_warm_call is not None and l_warm_cond is not None and l_warm_cond < l_warm_call and l_warm_call - l_warm_cond <= 3,
+        f"modeling_utils.py:{l_warm_cond} -> :{l_warm_call}")
+    add("[warmup] 確保は torch.empty(byte_count // factor, dtype=float16, device=...) の 1 回（factor=2 → モデル全体のバイト数）",
+        "_ = torch.empty(byte_count // factor, dtype=torch.float16, device=device, requires_grad=False)" in mu_text
+        and "factor = 2 if hf_quantizer is None" in mu_text, "modeling_utils.py::caching_allocator_warmup")
+    add("[warmup] 確保量は min(モデルのバイト数, 空き VRAM − 1.2GiB) に制限され、未使用の予約分を差し引く",
+        "byte_count = min(byte_count, max(0, int(device_memory - 1.2 * 1024**3)))" in mu_text
+        and "byte_count = max(0, byte_count - unused_memory)" in mu_text, "modeling_utils.py::caching_allocator_warmup")
+    add("[warmup] アクセラレータ以外（cpu / disk / meta）のデバイスマップでは何も確保しない",
+        "if is_accelerator_device(device)" in mu_text and "if not accelerator_device_map:\n        return" in mu_text,
+        "modeling_utils.py::caching_allocator_warmup")
+    l_miss = line_of(mu_text, "model._move_missing_keys_from_meta_to_cpu(missing_keys + mismatched_keys, dtype, hf_quantizer)")
+    l_init = line_of(mu_text, "model._initialize_missing_keys(missing_keys + mismatched_keys, is_quantized)")
+    add("[ロード順序] 欠損キーの CPU 実体化と初期化（initialize_weights）→ warmup → 重みの読み込み",
+        None not in (l_miss, l_init, l_warm_call) and l_miss < l_init < l_warm_call,
+        f"modeling_utils.py:{l_miss} -> :{l_init} -> :{l_warm_call}")
+    add("[safe_open] 重みの読み込み中に開いたままなのは 1 か所（file_pointer）。ほかは with 内で閉じる",
+        "file_pointer = safe_open(shard_file" in mu_text and "file_pointer.__exit__(None, None, None)" in mu_text
+        and mu_text.count("with safe_open(") == 2 and mu_text.count("= safe_open(") == 1,
+        "modeling_utils.py::_load_state_dict_into_meta_model / load_state_dict / dtype 判定")
+    add("[並列ロード] スレッドプールでの並列ロードは HF_ENABLE_PARALLEL_LOADING が真のときだけ（既定は直列）",
+        'os.environ.get("HF_ENABLE_PARALLEL_LOADING", "").upper() in ENV_VARS_TRUE_VALUES' in mu_text,
+        "modeling_utils.py::_load_pretrained_model")
+
     ok_all = all(c["ok"] for c in checks)
     for c in checks:
         print(f"[{'OK' if c['ok'] else 'NG'}] {c['item']}  ({c['detail']})")

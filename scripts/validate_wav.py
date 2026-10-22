@@ -6,13 +6,15 @@
 import json
 import sys
 
-import numpy as np
-import soundfile as sf
-
 SILENCE_RMS = 1e-3
 
 
 def validate(path, expected_sec, tol=1.5):
+    # numpy / soundfile は検証時にだけ import する（import だけで commit が約 780MB 増えるため、
+    # 診断ランナー等が phase0_run を import しても軽量なままにする）
+    import numpy as np
+    import soundfile as sf
+
     info = sf.info(path)
     data, sr = sf.read(path, dtype="float32", always_2d=True)
     frames = data.shape[0]

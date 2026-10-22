@@ -50,6 +50,7 @@ MIN_COMMIT_HEADROOM_GB = 8.0
 MIN_FREE_VRAM_MIB = 3500
 ABORT_FREE_RAM_GB = 1.5    # 実行中にこれを下回ったら自エンジンを正常停止して中断
 ABORT_CONSECUTIVE = 3
+ABORT_COMMIT_HEADROOM_GB = 3.0  # commit 余裕がこれを下回ったら所有プロセスのみ停止（commit 上限超過はネイティブクラッシュの原因になる）
 
 sys.path.insert(0, str(ROOT / "scripts"))
 from validate_wav import validate  # noqa: E402
@@ -134,24 +135,43 @@ def mem_snapshot():
             "pagefile_used_gb": round(sw.used / 1024**3, 2), "pagefile_total_gb": round(sw.total / 1024**3, 2)}
 
 
+import ctypes as _ctypes  # noqa: E402
+
+
+class _MS(_ctypes.Structure):
+    _fields_ = [("dwLength", _ctypes.c_ulong), ("dwMemoryLoad", _ctypes.c_ulong),
+                ("ullTotalPhys", _ctypes.c_ulonglong), ("ullAvailPhys", _ctypes.c_ulonglong),
+                ("ullTotalPageFile", _ctypes.c_ulonglong), ("ullAvailPageFile", _ctypes.c_ulonglong),
+                ("ullTotalVirtual", _ctypes.c_ulonglong), ("ullAvailVirtual", _ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", _ctypes.c_ulonglong)]
+
+
+_MS_LOCK = threading.Lock()
+
+
+def _global_status():
+    m = _MS()
+    m.dwLength = _ctypes.sizeof(_MS)
+    with _MS_LOCK:
+        _ctypes.windll.kernel32.GlobalMemoryStatusEx(_ctypes.byref(m))
+    return m
+
+
 def commit_info():
     """コミット済みメモリとコミット上限（GlobalMemoryStatusEx: ullTotalPageFile = 上限）。"""
-    import ctypes
-
-    class MS(ctypes.Structure):
-        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-
-    m = MS()
-    m.dwLength = ctypes.sizeof(MS)
-    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+    m = _global_status()
     gb = 1024**3
     return {"commit_limit_gb": round(m.ullTotalPageFile / gb, 1),
             "commit_used_gb": round((m.ullTotalPageFile - m.ullAvailPageFile) / gb, 1),
             "commit_headroom_gb": round(m.ullAvailPageFile / gb, 1)}
+
+
+def fast_status():
+    """(空き物理 RAM GB, メモリ使用率 %, commit 余裕 GB)。GlobalMemoryStatusEx 1 回（約 µs）。
+    psutil.virtual_memory() はこの環境で約 20ms かかるため、周期的な採取には使わない。"""
+    m = _global_status()
+    gb = 1024**3
+    return m.ullAvailPhys / gb, int(m.dwMemoryLoad), round(m.ullAvailPageFile / gb, 1)
 
 
 def top_consumers(n=8):
@@ -317,35 +337,57 @@ class Monitor(threading.Thread):
         self.min_free_ram = 1e9
         self.pressure = False
         self._low = 0
+        self._clow = 0
+        self.min_commit_headroom = 1e9
+        self.max_gap = 0.0
         self.lock = threading.Lock()
 
     def run(self):
+        """約 1 秒周期で採取する。1 回の収集が重い処理（nvidia-smi 約 165ms、子孫列挙 約 56ms、psutil の
+        virtual_memory / swap 約 50ms）を毎回行うと周期が 1.3〜3 秒に伸びるため、軽量な処理だけを毎回行い、重い処理は
+        間引く（子孫列挙は 5 回に 1 回、pagefile 等は 10 回に 1 回）。待機は処理時間を差し引いて周期を保つ。
+        瞬間的なピークは、子プロセス側の高頻度サンプラー（0.1 秒、.stream.jsonl）で観測する。"""
         n = 0
+        procs = []
+        slow = mem_snapshot()
+        last_t = None
         with open(TELEMETRY, "a", encoding="utf-8") as f:
             while not self.stop_flag:
+                t_loop = time.perf_counter()
+                if last_t is not None:
+                    self.max_gap = max(self.max_gap, t_loop - last_t)
+                last_t = t_loop
                 used, _ = gpu_mem_mib()
+                if n % 5 == 0:
+                    try:
+                        root = psutil.Process(self.root_pid)
+                        procs = [root] + root.children(recursive=True)
+                    except psutil.Error:
+                        procs = []
                 rss = 0
                 private = 0  # Windows の private bytes（コミット量。ファイルマップ分を含まない）
-                try:
-                    p = psutil.Process(self.root_pid)
-                    for q in [p] + p.children(recursive=True):
-                        try:
-                            mi = q.memory_info()
-                            rss += mi.rss
-                            private += getattr(mi, "private", 0)
-                        except psutil.Error:
-                            pass
-                except psutil.Error:
-                    pass
-                snap = mem_snapshot()
+                for q in procs:
+                    try:
+                        mi = q.memory_info()
+                        rss += mi.rss
+                        private += getattr(mi, "private", 0)
+                    except psutil.Error:
+                        pass
+                if n % 10 == 0:
+                    slow = mem_snapshot()
+                avail_phys, load_pct, commit_headroom = fast_status()
+                snap = {**slow, "free_ram_gb": round(avail_phys, 2), "ram_used_pct": load_pct}
                 with self.lock:
                     if used:
                         self.max_vram = max(self.max_vram, used)
                     self.max_rss = max(self.max_rss, rss)
                     self.max_private = max(self.max_private, private)
                     self.min_free_ram = min(self.min_free_ram, snap["free_ram_gb"])
+                    self.min_commit_headroom = min(self.min_commit_headroom, commit_headroom)
                     self._low = self._low + 1 if snap["free_ram_gb"] < ABORT_FREE_RAM_GB else 0
-                    if self._low >= ABORT_CONSECUTIVE:
+                    # commit 上限の超過は物理 RAM に余裕があっても起きる（DiT 診断で観測）。commit 余裕も監視して中断する
+                    self._clow = self._clow + 1 if commit_headroom < ABORT_COMMIT_HEADROOM_GB else 0
+                    if self._low >= ABORT_CONSECUTIVE or self._clow >= ABORT_CONSECUTIVE:
                         self.pressure = True
                 n += 1
                 if True:  # 1秒間隔で書き出し
@@ -353,17 +395,21 @@ class Monitor(threading.Thread):
                                         "phase": self.phase,
                                         "vram_mib": used,
                                         "tree_rss_mb": round(rss / 1048576),
-                                        "tree_private_mb": round(private / 1048576), **snap}) + "\n")
+                                        "tree_private_mb": round(private / 1048576),
+                                        "commit_headroom_gb": commit_headroom, **snap}) + "\n")
                     f.flush()
-                time.sleep(1)
+                time.sleep(max(0.0, 1.0 - (time.perf_counter() - t_loop)))
 
     def snapshot_and_reset(self):
         with self.lock:
             r = {"max_vram_mib": self.max_vram, "max_rss_mb": round(self.max_rss / 1048576),
                  "max_private_mb": round(self.max_private / 1048576),
-                 "min_free_ram_gb": None if self.min_free_ram == 1e9 else self.min_free_ram}
+                 "min_free_ram_gb": None if self.min_free_ram == 1e9 else self.min_free_ram,
+                 "min_commit_headroom_gb": None if self.min_commit_headroom == 1e9 else self.min_commit_headroom,
+                 "sample_interval_max_s": round(self.max_gap, 2)}
             self.max_vram = self.max_rss = self.max_private = 0
             self.min_free_ram = 1e9
+            self.min_commit_headroom = 1e9
         return r
 
 
